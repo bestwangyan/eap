@@ -1,0 +1,74 @@
+/* ===== EAP 全局布局基础 =====
+   锁定视口高度链路：html → body → #root → .app-shell，
+   页面滚动只发生在最内层的消息列表容器内，窗口本身永不滚动。
+   输入框固定在底部依赖这条链路不被破坏。 */
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  overflow: hidden;
+  background: #f7f8fa;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* 应用外壳：优先用动态视口高度（移动端地址栏/软键盘会压缩 100vh，
+   导致输入框被顶出屏幕外——这是输入框"不能固定在底部"的根因之一） */
+.app-shell {
+  height: 100vh;
+}
+
+@supports (height: 100dvh) {
+  .app-shell {
+    height: 100dvh;
+  }
+}
+
+/* 消息列表滚动容器 */
+.messages-scroll {
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: #d0d5dd transparent;
+}
+
+.messages-scroll::-webkit-scrollbar {
+  width: 6px;
+}
+
+.messages-scroll::-webkit-scrollbar-thumb {
+  background: #d0d5dd;
+  border-radius: 3px;
+}
+
+/* 流式输出光标 */
+.stream-caret {
+  display: inline-block;
+  width: 2px;
+  height: 16px;
+  background: #1d4ed8;
+  margin-left: 3px;
+  vertical-align: -2px;
+  animation: eap-blink 1s step-end infinite;
+}
+
+@keyframes eap-blink {
+  0%, 50% { opacity: 1; }
+  51%, 100% { opacity: 0; }
+}
+
+/* 运行中状态脉冲（工具执行 / 生成中） */
+.eap-pulse {
+  animation: eap-soft 1.4s ease-in-out infinite;
+}
+
+@keyframes eap-soft {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}

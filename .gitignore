@@ -1,0 +1,32 @@
+# ===== 依赖与构建产物 =====
+frontend/node_modules/
+frontend/dist/
+backend/.venv/
+__pycache__/
+*.pyc
+
+# ===== 本地环境与密钥（真实凭据只存在于本地/服务器，禁止提交）=====
+.env
+.env.*
+!.env.example
+.make.env
+scripts/.test.env
+
+# ===== Claude Code 本地配置（含历史命令中的服务器密码）=====
+.claude/settings.local.json
+
+# ===== 技能安装缓存 =====
+.agents/
+
+# ===== 运行时产物 =====
+logs/
+*.log
+skills_storage/
+uploads/
+
+# ===== 架构图可视化检查产物（截图/回执，保留主 HTML 与规格）=====
+doc/eap-architecture.visual-check*
+doc/*.png
+
+# ===== 系统文件 =====
+.DS_Store

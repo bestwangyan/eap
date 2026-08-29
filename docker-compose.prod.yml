@@ -1,0 +1,56 @@
+# ============================================================
+# EAP 企业 Agent 平台 - 生产环境
+# 部署于 192.168.1.51 路径 /home/wangyan/deploy/eap
+#
+# PostgreSQL / Redis 使用服务器原生服务 (非容器化)
+# 后端使用 host 网络直接访问本机中间件
+# ============================================================
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: eap-backend:latest
+    container_name: eap_backend
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      FLASK_ENV: production
+      DATABASE_URL: postgresql://eap:CHANGE_ME@127.0.0.1:5432/eap
+      REDIS_URL: redis://:CHANGE_ME@127.0.0.1:6379/0
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
+      LLM_PROVIDER: deepseek
+      LLM_MODEL: deepseek-v4-pro
+      SECRET_KEY: ${SECRET_KEY:-prod-secret-change-me}
+      CORS_ALLOWED_ORIGINS: http://192.168.1.51,http://192.168.1.51:3000
+    command: >
+      gunicorn wsgi:app --bind 0.0.0.0:5003
+      --worker-class gevent --workers 4 --timeout 120
+      --access-logfile - --error-logfile -
+    volumes:
+      - eap_uploads:/tmp/eap_uploads
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: eap-frontend:latest
+    container_name: eap_frontend
+    restart: unless-stopped
+    network_mode: host
+    depends_on:
+      - backend
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+volumes:
+  eap_uploads:

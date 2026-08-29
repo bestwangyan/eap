@@ -1,0 +1,39 @@
+# ============================================================
+# EAP 企业 Agent 平台 - 本地开发环境
+# 中间件 (PG/Redis/Nginx) 在 192.168.1.51 上
+# ============================================================
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: gunicorn wsgi:app --bind 0.0.0.0:5003 --worker-class gevent --workers 2 --timeout 120 --reload --log-level info
+    ports:
+      - "5003:5003"
+    environment:
+      FLASK_ENV: development
+      DATABASE_URL: postgresql://eap:CHANGE_ME@192.168.1.51:5432/eap
+      REDIS_URL: redis://:CHANGE_ME@192.168.1.51:6379/0
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      LLM_PROVIDER: deepseek
+      LLM_MODEL: deepseek-v4-pro
+      SECRET_KEY: ${SECRET_KEY:-dev-secret-key-change-in-prod}
+    volumes:
+      - ./backend:/app
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    command: npm run dev
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend/src:/app/src
+      - ./frontend/index.html:/app/index.html
+      - ./frontend/vite.config.ts:/app/vite.config.ts
+    depends_on:
+      - backend

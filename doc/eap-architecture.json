@@ -1,0 +1,377 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "EAP 企业 Agent 平台架构",
+    "output": "eap-architecture.html",
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "request-path",
+        "label": "请求主链路",
+        "focus": [
+          "browser",
+          "nginx",
+          "flask",
+          "guardrails",
+          "orchestrator",
+          "llm"
+        ],
+        "note": "从浏览器出发，经过入口、安全围栏，抵达模型通道。"
+      },
+      {
+        "id": "agent-core",
+        "label": "Agent 装配",
+        "focus": [
+          "orchestrator",
+          "tools",
+          "subagents",
+          "mcp"
+        ],
+        "note": "编排器按 Agent 配置装配工具、子 Agent 与 MCP。"
+      },
+      {
+        "id": "session-data",
+        "label": "会话与数据",
+        "focus": [
+          "flask",
+          "redis",
+          "orchestrator",
+          "pg",
+          "trace"
+        ],
+        "note": "会话状态、消息持久化与可观测性。"
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "browser",
+      "type": "frontend",
+      "label": "浏览器",
+      "sublabel": "React 18 SPA · AntD",
+      "pos": [
+        40,
+        280
+      ],
+      "size": [
+        130,
+        60
+      ]
+    },
+    {
+      "id": "nginx",
+      "type": "backend",
+      "label": "Nginx",
+      "sublabel": ":80 · 静态 + 反代",
+      "pos": [
+        250,
+        280
+      ],
+      "size": [
+        130,
+        60
+      ]
+    },
+    {
+      "id": "flask",
+      "type": "backend",
+      "label": "Flask API",
+      "sublabel": "Gunicorn :5003",
+      "pos": [
+        460,
+        280
+      ],
+      "size": [
+        130,
+        60
+      ]
+    },
+    {
+      "id": "guardrails",
+      "type": "security",
+      "label": "安全围栏",
+      "sublabel": "PII 脱敏 · 危险拦截",
+      "pos": [
+        670,
+        280
+      ],
+      "size": [
+        130,
+        60
+      ]
+    },
+    {
+      "id": "orchestrator",
+      "type": "backend",
+      "label": "Agent 编排器",
+      "sublabel": "LangGraph StateGraph",
+      "pos": [
+        880,
+        280
+      ],
+      "size": [
+        150,
+        64
+      ],
+      "tag": "核心"
+    },
+    {
+      "id": "llm",
+      "type": "external",
+      "label": "模型通道",
+      "sublabel": "DeepSeek · OpenAI · LM Studio",
+      "pos": [
+        1140,
+        280
+      ],
+      "size": [
+        160,
+        60
+      ]
+    },
+    {
+      "id": "redis",
+      "type": "database",
+      "label": "Redis 7",
+      "sublabel": "会话 · RBAC 权限",
+      "pos": [
+        460,
+        100
+      ],
+      "size": [
+        130,
+        60
+      ]
+    },
+    {
+      "id": "tools",
+      "type": "backend",
+      "label": "工具集",
+      "sublabel": "计算 · 搜索 · 记忆 · 代码",
+      "pos": [
+        880,
+        100
+      ],
+      "size": [
+        150,
+        60
+      ]
+    },
+    {
+      "id": "mcp",
+      "type": "external",
+      "label": "MCP Servers",
+      "sublabel": "stdio · SSE 远程",
+      "pos": [
+        1140,
+        100
+      ],
+      "size": [
+        130,
+        60
+      ]
+    },
+    {
+      "id": "subagents",
+      "type": "backend",
+      "label": "子 Agent / Skill",
+      "sublabel": "agent-mode · 资源包",
+      "pos": [
+        1140,
+        430
+      ],
+      "size": [
+        150,
+        60
+      ]
+    },
+    {
+      "id": "pg",
+      "type": "database",
+      "label": "PostgreSQL 16",
+      "sublabel": "消息 · 检查点 · pgvector",
+      "pos": [
+        880,
+        430
+      ],
+      "size": [
+        160,
+        60
+      ]
+    },
+    {
+      "id": "trace",
+      "type": "backend",
+      "label": "监控 Trace",
+      "sublabel": "trace_events · 成本统计",
+      "pos": [
+        670,
+        390
+      ],
+      "size": [
+        130,
+        60
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "内网服务器 192.168.1.51",
+      "wraps": [
+        "nginx",
+        "flask",
+        "guardrails",
+        "orchestrator",
+        "tools",
+        "subagents",
+        "trace",
+        "redis",
+        "pg"
+      ],
+      "pad": 28
+    }
+  ],
+  "connections": [
+    {
+      "id": "browser-nginx",
+      "from": "browser",
+      "to": "nginx",
+      "label": "/eap/ · HTTP",
+      "variant": "emphasis"
+    },
+    {
+      "id": "nginx-flask",
+      "from": "nginx",
+      "to": "flask",
+      "label": "反代 /eap/api/*"
+    },
+    {
+      "id": "flask-guardrails",
+      "from": "flask",
+      "to": "guardrails",
+      "label": "输入检查",
+      "variant": "security"
+    },
+    {
+      "id": "guardrails-orch",
+      "from": "guardrails",
+      "to": "orchestrator",
+      "label": "SSE 流式",
+      "variant": "emphasis"
+    },
+    {
+      "id": "orch-llm",
+      "from": "orchestrator",
+      "to": "llm",
+      "label": "逐 token 调用",
+      "variant": "emphasis"
+    },
+    {
+      "id": "flask-redis",
+      "from": "flask",
+      "to": "redis",
+      "label": "JWT 会话 · 权限",
+      "fromSide": "top",
+      "toSide": "bottom",
+      "labelDy": -64
+    },
+    {
+      "id": "orch-tools",
+      "from": "orchestrator",
+      "to": "tools",
+      "label": "工具绑定",
+      "fromSide": "top",
+      "toSide": "bottom",
+      "labelDy": -64
+    },
+    {
+      "id": "orch-subagents",
+      "from": "orchestrator",
+      "to": "subagents",
+      "label": "委派子任务"
+    },
+    {
+      "id": "orch-mcp",
+      "from": "orchestrator",
+      "to": "mcp",
+      "label": "MCP 工具",
+      "variant": "dashed",
+      "via": [
+        [
+          1130,
+          312
+        ],
+        [
+          1130,
+          130
+        ],
+        [
+          1205,
+          130
+        ]
+      ]
+    },
+    {
+      "id": "orch-pg",
+      "from": "orchestrator",
+      "to": "pg",
+      "label": "检查点 · 消息落库",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "orch-trace",
+      "from": "orchestrator",
+      "to": "trace",
+      "label": "回调事件",
+      "variant": "dashed"
+    },
+    {
+      "id": "trace-pg",
+      "from": "trace",
+      "to": "pg",
+      "label": "事件落库",
+      "variant": "dashed",
+      "labelDy": 24
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "接入层",
+      "items": [
+        "Nginx 统一入口，/eap/ 静态 SPA + API 反代",
+        "SSE 端点关闭缓冲，逐 token 直通前端"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Agent 核心",
+      "items": [
+        "LangGraph 双流：逐 token + 完整工具参数",
+        "checkpoint 双持久化与一致性校验",
+        "按 Agent 配置动态装配工具 / 子 Agent / Skill / MCP"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "安全与治理",
+      "items": [
+        "安全围栏：PII 脱敏 + 危险拦截",
+        "JWT + Redis 会话，权限即时吊销，RBAC 拦截",
+        "多租户隔离：查询按 tenant_id 过滤，线程 ID 隔离"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "可观测性",
+      "items": [
+        "全链路 LLM / 工具事件",
+        "token 成本统计，trace 可溯源",
+        "知识库检索走 pgvector 混合检索，关键词降级分词"
+      ]
+    }
+  ]
+}
