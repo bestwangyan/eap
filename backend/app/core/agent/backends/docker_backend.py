@@ -30,24 +30,37 @@ DEFAULT_EXECUTE_TIMEOUT = 120
 brief 草案的 10s 对 pip install 等合法长命令过短，故取实测生态默认。"""
 WORKSPACE_MOUNT = "/workspace"
 """宿主 root_dir 在容器内的挂载点。"""
+MEMORY_ROOT = "/memory"
+"""平台记忆文件根（DeepAgentFactory 统一传入 "/memory/AGENTS.md"）。
+本地/无 execute 变体（FilesystemBackend virtual_mode）天然映射到
+root_dir/memory/；完整容器变体在此显式映射到同一宿主落点
+（容器内挂载视角为 /workspace/memory/AGENTS.md）。"""
 
 
 def _map_to_host(root_dir: Path, sandbox_path: str) -> Path | None:
-    """沙箱绝对路径（/workspace/...）→ 宿主 root_dir 内路径。
+    """沙箱绝对路径 → 宿主 root_dir 内路径。
 
-    仅接受 /workspace 前缀的路径；resolve() 做词法归一（阻断 `..` 穿越）
-    并解析已存在父目录的符号链接，最终必须仍位于 root_dir 之内，
-    否则返回 None（fail-closed，拒绝宿主机逃逸）。
+    接受两类前缀：
+      /workspace/* → root_dir/*（挂载视角：/workspace 即 root_dir）
+      /memory/*    → root_dir/memory/*（平台记忆文件；MemoryMiddleware
+                      download_files 读入，write_file 工具经 upload 落盘）
+    其余路径返回 None（fail-closed，拒绝宿主机逃逸）。
+    resolve() 做词法归一（阻断 `..` 穿越）并解析已存在父目录的符号链接，
+    最终必须仍位于 root_dir 之内，否则返回 None。
     """
     p = Path(sandbox_path).resolve()
-    ws = Path(WORKSPACE_MOUNT).resolve()
+    root = root_dir.resolve()
     try:
-        rel = p.relative_to(ws)
+        rel = p.relative_to(Path(WORKSPACE_MOUNT).resolve())
     except ValueError:
-        return None
-    host = (root_dir.resolve() / rel).resolve()
+        try:
+            rel = p.relative_to(Path(MEMORY_ROOT).resolve())
+        except ValueError:
+            return None
+        rel = Path("memory") / rel   # /memory/x → root_dir/memory/x
+    host = (root / rel).resolve()
     try:
-        host.relative_to(root_dir.resolve())
+        host.relative_to(root)
     except ValueError:
         return None
     return host
@@ -101,12 +114,15 @@ class DockerBackend(BaseSandbox):
         # 退出后清理，挂起命令（如 `sleep infinity`，LLM 提示注入可构造）否则
         # 会永久泄漏容器（每个 256m）。
         cidfile = self.root_dir / f".eap-cid-{uuid.uuid4().hex}"
+        # --mount 而非 -v：线程工作目录含平台线程 id（`{tenant_slug}:{user_id}:{uuid}`，
+        # 如 default:1:1bb19970-...），-v 的 `host:container` 语法会按冒号切分 →
+        # "too many colons"；--mount 按逗号切分 key=value，src 中的冒号安全。
         cmd = [
             "docker", "run", "--rm",
             "--cidfile", str(cidfile),
             "--network", "none",
             "--memory", "256m", "--cpus", "1", "--pids-limit", "64",
-            "-v", f"{self.root_dir}:{WORKSPACE_MOUNT}",
+            "--mount", f"type=bind,src={self.root_dir},dst={WORKSPACE_MOUNT}",
             "-w", WORKSPACE_MOUNT,
             IMAGE, "sh", "-c", command,
         ]
