@@ -594,22 +594,40 @@ else
   bad "H6d 读回内容不符: $(sse_reply "$F")"
 fi
 
+# 触发 HITL 中断：模型有时先探索目录而不调用 write_file（非确定性），
+# 最多重试 3 次，后续尝试明确要求直接调用 write_file（同线程续聊）
+interrupt_retry() {
+    local out="$1" tid="${2:-}" base_msg="$3"
+    local f="" t=""
+    for i in 1 2 3; do
+        if [ "$i" = "1" ]; then
+            f=$(chat $HITL_AID "$base_msg" "$tid" "${out}_$i")
+        else
+            t=$(sse_thread "$f")
+            f=$(chat $HITL_AID "不要查找/探索目录，请直接调用 write_file 工具执行：$base_msg" "$t" "${out}_$i")
+        fi
+        grep -q '"type": "interrupt"' "$f" && { echo "$f"; return 0; }
+    done
+    echo "$f"
+    return 1
+}
+
 # H7: review Important-1 回归 —— 审批后放弃 → 新消息 → 再次中断 → 审批 → resume
 # 决定不串：批次1 已 approve 但放弃（不 resume，改发新消息）→ 批次2 新中断 →
 # approve 批次2 → resume 必须成功，且执行的是批次2 的写入（旧决议不得混入）
-F=$(chat $HITL_AID "请把文件 hitl_abandon.txt 的内容写为 batch-one，写完后确认" "" h7_intr)
-if grep -q '"type": "interrupt"' "$F"; then
+F=$(interrupt_retry "h7_intr" "" "请把文件 hitl_abandon.txt 的内容写为 batch-one（该文件还不存在，请直接写），写完后确认")
+if grep -q '"type": "interrupt"' "$F" 2>/dev/null; then
   B1ID=$(sse_interrupt "$F" | jget "d['approval_id']")
   ok "H7a 批次1 中断（approval_id=$B1ID）"
 else
-  bad "H7a 批次1 未中断: $(sse_error "$F")"
+  bad "H7a 批次1 未中断（3 次尝试模型仍未调用 write_file）: $(sse_error "$F")"
 fi
 TID_H7=$(sse_thread "$F")
 S=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$BASE/workflow/approvals/$B1ID/approve" -H "Authorization: Bearer $ATOKEN")
 [ "$S" = "200" ] && ok "H7b 批次1 approve（200，随后放弃不 resume）" || bad "H7b 批次1 approve 应 200, 实际 $S"
 # 放弃批次1：同线程发新消息（非 resume）→ checkpoint 清理 + 旧决议标记 orphaned
-F=$(chat $HITL_AID "请把文件 hitl_abandon.txt 的内容写为 batch-two，写完后确认" "$TID_H7" h7_intr2)
-if grep -q '"type": "interrupt"' "$F"; then
+F=$(interrupt_retry "h7_intr2" "$TID_H7" "请把文件 hitl_abandon.txt 的内容写为 batch-two（该文件还不存在，请直接写），写完后确认")
+if grep -q '"type": "interrupt"' "$F" 2>/dev/null; then
   B2ID=$(sse_interrupt "$F" | jget "d['approval_id']")
   if [ -n "$B2ID" ] && [ "$B2ID" != "$B1ID" ]; then
     ok "H7c 批次2 中断产生新审批（id=$B2ID，与批次1 $B1ID 不同）"
@@ -617,7 +635,7 @@ if grep -q '"type": "interrupt"' "$F"; then
     bad "H7c 批次2 审批异常（未产生新审批）: $F"
   fi
 else
-  bad "H7c 批次2 未中断: $(sse_error "$F")"
+  bad "H7c 批次2 未中断（3 次尝试模型仍未调用 write_file）: $(sse_error "$F")"
 fi
 S=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$BASE/workflow/approvals/$B2ID/approve" -H "Authorization: Bearer $ATOKEN")
 [ "$S" = "200" ] && ok "H7d 批次2 approve（200）" || bad "H7d 批次2 approve 应 200, 实际 $S"
