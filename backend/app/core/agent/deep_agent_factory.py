@@ -38,6 +38,7 @@ TOOL_DISPLAY_NAMES = {
     "read_file": "读取文件",
     "write_file": "写入文件",
     "edit_file": "编辑文件",
+    "delete": "删除文件",
     "glob": "查找文件",
     "grep": "内容搜索",
     "execute": "代码执行",
