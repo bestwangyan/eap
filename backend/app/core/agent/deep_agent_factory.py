@@ -20,6 +20,7 @@
 """
 import hashlib
 import logging
+from collections import OrderedDict
 
 from deepagents import create_deep_agent
 
@@ -55,13 +56,40 @@ INTERRUPT_ENABLED = False
 # 记忆文件在沙箱内的统一路径：经后端映射为
 #   local     → {thread_workspace}/memory/AGENTS.md
 #   container → {root_dir 挂载 /workspace}/memory/AGENTS.md
+#   container(无execute) → {root_dir}/memory/AGENTS.md（virtual_mode 映射）
 # 与 deepagents 内置 memory 工具的读写路径一致（保存后可被再次加载）。
 MEMORY_FILE = "/memory/AGENTS.md"
+
+# 编译图缓存上限：缓存键含 thread_id（执行后端线程工作目录编译期烘焙），
+# 每线程一条。maxsize=200 的 LRU 兜底防止长期运行无界膨胀
+# （review Important 3 修复）；线程删除路径另有精确 evict()。
+CACHE_MAXSIZE = 200
 
 
 class DeepAgentFactory:
     def __init__(self):
-        self._cache: dict[str, object] = {}
+        # OrderedDict 实现 LRU：命中 move_to_end，超限 popitem(last=False)
+        self._cache: OrderedDict[str, object] = OrderedDict()
+        # thread_id → 其全部 cache_key 的反向索引（evict 精确淘汰，无需
+        # 子串匹配；LRU 淘汰时同步清理）
+        self._thread_keys: dict[str, set[str]] = {}
+
+    def evict(self, thread_id: str) -> None:
+        """线程删除时精确淘汰该线程的全部编译图（按 cache_key 中 thread_id 段）。
+
+        orchestrator.delete_thread_checkpoint 路径调用；LRU 淘汰之外的另一条
+        释放通道，让被删线程的工作区目录与检查点尽快一起回收。
+        """
+        keys = self._thread_keys.pop(thread_id, None)
+        if not keys:
+            return
+        for key in keys:
+            self._cache.pop(key, None)
+        logger.info("Evicted %d cached graph(s) for thread %s", len(keys), thread_id)
+
+    def iter_graphs(self) -> list:
+        """遍历当前缓存的全部编译图（get_thread_state 方案 B 降级查询用）。"""
+        return list(self._cache.values())
 
     def build(self, tenant_id: str, agent_id: int | None, user_id: str,
               provider_config: dict, thread_id: str,
@@ -70,20 +98,28 @@ class DeepAgentFactory:
 
         tools: orchestrator._resolve_tools 的返回（DEFAULT_TOOLS 过滤 +
         MCP 工具），作为最终 EAP 工具集；None 时退化为按 tools_config
-        从 DEFAULT_TOOLS 自过滤。deepagents 默认工具（ls/read_file/
-        write_file/edit_file/glob/grep/execute/task/write_todos）由
-        create_deep_agent 自动追加，不在此列。
+        从 DEFAULT_TOOLS 自过滤。deepagents 默认文件工具（ls/read_file/
+        write_file/edit_file/glob/grep/delete/task/write_todos）由
+        create_deep_agent 自动追加，不在此列；execute 由 backend 变体
+        控制（tools_config 含 code_execution → 完整 DockerBackend，
+        否则 DockerBackendNoShell → 模型请求无 execute）。
         """
         agent = None
         skills, subagents, interrupt_on, backend_mode = [], [], [], "local"
         tool_names = None
+        execute_enabled = True
 
         if agent_id:
             agent = AgentConfig.query.filter_by(
                 id=agent_id, tenant_id=int(tenant_id)).first()
         if agent:
-            # tools_config：自有工具按配置过滤（code_execution 名字 → execute 开关）
+            # tools_config：自有工具按配置过滤；
+            # code_execution 名字 → execute 启用开关（review Important 1）：
+            #   tools_config 含 "code_execution" → 完整 DockerBackend（有 execute）
+            #   不含 → DockerBackendNoShell（不实现 SandboxBackendProtocol，
+            #   deepagents 从模型请求过滤 execute）
             tool_names = set(agent.tools_config or [])
+            execute_enabled = "code_execution" in tool_names
             backend_mode = (agent.backend or "local")
             interrupt_on = (
                 HITL_TOOLS
@@ -112,17 +148,20 @@ class DeepAgentFactory:
                     tenant_id=int(tenant_id), parent_agent_id=agent_id, is_active=True).all():
                 subagents.append(self._db_subagent(sub, tenant_id))
 
-        # 自有工具集（含子代理可继承的常用工具；execute 由 deepagents 内置提供，
-        # 当 tools_config 未勾选 code_execution 时排除 deepagents 默认工具中的 execute）
+        # 自有工具集（含子代理可继承的常用工具；execute 不在此列 —— 由
+        # deepagents 按 backend 变体注入：execute_enabled 时完整 DockerBackend
+        # 提供，否则 DockerBackendNoShell 使模型请求中无 execute）
         if tools is None:
             tools = self._filter_own_tools(tool_names)
 
-        backend = build_backend(backend_mode, str(tenant_id), str(user_id), thread_id)
+        backend = build_backend(backend_mode, str(tenant_id), str(user_id),
+                                thread_id, execute=execute_enabled)
 
         cache_key = self._cache_key(tenant_id, agent_id, provider_config,
                                     backend_mode, subagents, interrupt_on,
-                                    thread_id, tools)
+                                    thread_id, tools, execute_enabled)
         if cache_key in self._cache:
+            self._cache.move_to_end(cache_key)   # LRU 命中刷新
             return self._cache[cache_key], cache_key
 
         graph = create_deep_agent(
@@ -135,7 +174,19 @@ class DeepAgentFactory:
             interrupt_on=interrupt_on or None,
             checkpointer=provider_config["_checkpointer"],
         )
+        # LRU 插入：超限淘汰最久未用（popitem(last=False)），并同步反向索引
+        # （空集线程条目一并清理，防止线程 id 残留）
         self._cache[cache_key] = graph
+        self._cache.move_to_end(cache_key)
+        self._thread_keys.setdefault(thread_id, set()).add(cache_key)
+        if len(self._cache) > CACHE_MAXSIZE:
+            oldest_key, _ = self._cache.popitem(last=False)
+            for t in list(self._thread_keys):
+                ks = self._thread_keys[t]
+                ks.discard(oldest_key)
+                if not ks:
+                    del self._thread_keys[t]
+            logger.info("LRU evicted graph %s (cache size %d)", oldest_key, len(self._cache))
         return graph, cache_key
 
     # ---------- 内部 ----------
@@ -184,14 +235,14 @@ class DeepAgentFactory:
         })
 
     def _filter_own_tools(self, tool_names: set | None) -> list:
-        """自有工具过滤；deepagents 默认工具（含 execute）由其自身提供，
-        code_execution 配置名映射为 execute 启用开关，见 orchestrator 组装处。"""
+        """自有工具过滤（DEFAULT_TOOLS 子集，不含 execute）。"""
         if tool_names is None:
             return list(DEFAULT_TOOLS)
         return [t for t in DEFAULT_TOOLS if t.name in tool_names]
 
     def _cache_key(self, tenant_id, agent_id, provider_config, backend_mode,
-                   subagents, interrupt_on, thread_id, final_tools) -> str:
+                   subagents, interrupt_on, thread_id, final_tools,
+                   execute_enabled) -> str:
         endpoint = hashlib.sha256(
             f"{provider_config.get('api_base', '')}|{provider_config.get('api_key', '')}".encode()
         ).hexdigest()[:8]
@@ -199,6 +250,9 @@ class DeepAgentFactory:
             provider_config["provider"], provider_config["model_name"],
             ",".join(sorted(t.name for t in final_tools)),
             backend_mode,
+            # execute 开关维度：同配置下 DockerBackend / DockerBackendNoShell
+            # 是两张不同的图，缓存键必须区分
+            "exec" if execute_enabled else "noexec",
             ",".join(sorted(s["name"] for s in subagents)),
             ",".join(interrupt_on or []),
             endpoint,

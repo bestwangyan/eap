@@ -335,7 +335,10 @@ class AgentOrchestrator:
           → 返回全部 DEFAULT_TOOLS
 
         Agent 配置了 tools_config（如 ["calculator", "web_search"]）：
-          → 从 DEFAULT_TOOLS 中筛选出匹配的工具
+          → 从 DEFAULT_TOOLS 中筛选出匹配的工具，一律返回过滤结果
+            （允许空列表 —— tools_config=["code_execution"] 的 agent 只应
+            获得 deepagents 默认工具 + execute，绝不可回退全量 DEFAULT_TOOLS
+            静默扩权，review Important 2 修复）
           → 工具名不存在于 DEFAULT_TOOLS 中的会跳过并记录 warning
             （code_execution 名字保留为 execute 启用开关，本身不再解析）
 
@@ -375,8 +378,11 @@ class AgentOrchestrator:
             mcp_tools = self._build_mcp_tools(agent_id, tenant_id)
             resolved.extend(mcp_tools)
 
-            # 如果所有配置的工具都不存在，回退到全部默认工具
-            return resolved if resolved else list(self._tools)
+            # 修复（review Important 2）：agent 存在且 tools_config 非空时
+            # 一律返回过滤结果（允许空列表）——tools_config=["code_execution"]
+            # 的 agent 只应获得 deepagents 默认工具 + execute。仅当 agent
+            # 不存在或未配置 tools_config 时（上文分支）才回退全量。
+            return resolved
 
         except Exception as e:
             logger.warning(f"Failed to resolve tools for agent {agent_id}: {e}")
@@ -926,6 +932,11 @@ class AgentOrchestrator:
             logger.info(
                 f"Cleaned up {deleted} checkpoint rows for thread {thread_id}"
             )
+        # 线程删除时同步淘汰其编译图缓存（review Important 3）：
+        # 检查点已删，缓存的图实例（内含该线程工作区引用）一并释放。
+        # 无论检查点是否命中都执行 —— 图缓存与检查点相互独立。
+        if self._deep_factory:
+            self._deep_factory.evict(thread_id)
         return deleted > 0
 
     def get_thread_state(self, thread_id: str) -> dict | None:
@@ -959,9 +970,10 @@ class AgentOrchestrator:
 
         # 方案 B：降级到图实例的 get_state()
         # 遍历 DeepAgentFactory 缓存的所有图，用第一个能找到状态的
+        # （经公开方法 iter_graphs()，不直接触碰内部 _cache）
         factory = self._deep_factory
         if factory:
-            for graph in factory._cache.values():
+            for graph in factory.iter_graphs():
                 try:
                     state = graph.get_state(config)
                     if state and state.values:

@@ -10,11 +10,13 @@ grep/glob/delete 均以 python3 脚本经 execute() 在容器内执行（本镜�
 python3），并返回协议规定的结构化结果（LsResult/ReadResult/...）。本类
 只需实现四个原语：execute / upload_files / download_files / id。
 """
+import os
 import re
 import subprocess
 import uuid
 from pathlib import Path
 
+from deepagents.backends.filesystem import FilesystemBackend
 from deepagents.backends.protocol import (
     ExecuteResponse,
     FileDownloadResponse,
@@ -201,3 +203,34 @@ class DockerBackend(BaseSandbox):
             except OSError as e:
                 responses.append(FileDownloadResponse(path=path, error=str(e)))
         return responses
+
+
+class DockerBackendNoShell(FilesystemBackend):
+    """container 模式的"无 execute"变体（code_execution 启用开关 = 关）。
+
+    review Important 1 修复：deepagents 0.7.11 的默认工具不可按名字裁剪，
+    execute 只在 backend 实现 SandboxBackendProtocol 时注入模型请求
+    （middleware 的 supports_execution() → _filter_unsupported_tools_and_
+    apply_prompt 会把 execute 从模型 schema 中剔除）。因此开关改为
+    backend 变体控制：
+
+    - 本类仅实现 BackendProtocol（文件操作），不实现 SandboxBackendProtocol
+      —— 不继承 BaseSandbox、无 execute() 方法 → supports_execution()
+      isinstance 检查为 False → execute 对模型不可见/不可调；
+    - 文件操作直接复用 deepagents FilesystemBackend 的宿主侧纯 Python
+      实现（virtual_mode=True，路径语义与沙箱一致）：root_dir 挂载为容器
+      /workspace，宿主视角与容器视角完全等价，无需任何 shell；
+    - delete 在 FilesystemBackend 中已实现 → 不被 _supports_delete 过滤。
+
+    与完整 DockerBackend 的唯一差异即缺失 execute（无容器拉起、无 shell）；
+    文件能力（ls/read/write/edit/delete/glob/grep/upload/download）与
+    memory 语义（/memory/AGENTS.md → root_dir/memory/AGENTS.md）保持一致。
+    """
+
+    def __init__(self, root_dir: str):
+        os.makedirs(root_dir, exist_ok=True)
+        super().__init__(root_dir=root_dir)  # virtual_mode=True（默认）
+
+    @property
+    def id(self) -> str:
+        return f"docker-noshell:{self.cwd}"
