@@ -214,6 +214,12 @@ export default function AgentManagerPage() {
                 { label: 'async', value: 'async' },
               ]} />
             </Form.Item>
+            <Form.Item name="model_provider_id" label="模型后端"
+              tooltip="子代理使用的模型供应商；不选则继承主代理">
+              <Select style={{ width: 220 }} allowClear placeholder="继承主代理"
+                options={availableModels.map((m) => ({
+                  label: `${m.name}${m.is_default ? ' (默认)' : ''}`, value: m.id }))} />
+            </Form.Item>
             <Form.Item>
               <Button type="primary" icon={<PlusOutlined />} onClick={handleCreateSub}>添加</Button>
             </Form.Item>

@@ -13,6 +13,9 @@ class SubAgentDefinition(BaseModel):
     role_prompt = db.Column(db.Text, nullable=False)
     tools = db.Column(db.JSON, default=list)
     model = db.Column(db.String(100))
+    model_provider_id = db.Column(
+        db.Integer, db.ForeignKey("model_providers.id")
+    )  # 子代理独立模型后端，为空时继承主代理
     mode = db.Column(db.String(20), default="inline")  # inline | compiled | async
     is_active = db.Column(db.Boolean, default=True)
 
@@ -26,5 +29,6 @@ class SubAgentDefinition(BaseModel):
             "parent_agent_id": self.parent_agent_id,
             "name": self.name, "role_prompt": self.role_prompt,
             "tools": self.tools, "model": self.model,
+            "model_provider_id": self.model_provider_id,
             "mode": self.mode, "is_active": self.is_active,
         }

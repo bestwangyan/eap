@@ -33,6 +33,7 @@ def create_sub_agent(agent_id):
         tenant_id=g.tenant_id, parent_agent_id=agent_id,
         name=data["name"], role_prompt=data["role_prompt"],
         tools=data.get("tools", []), model=data.get("model"),
+        model_provider_id=data.get("model_provider_id"),
         mode=data.get("mode", "inline"),
     )
     db.session.add(sub)

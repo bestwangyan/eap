@@ -30,6 +30,20 @@ def list_resources():
     kb_collections = [{"id": c.id, "name": c.name, "description": c.description}
                       for c in KnowledgeCollection.query.filter_by(tenant_id=g.tenant_id).all()]
 
+    # deepagents 默认工具（统一开关：默认全开）
+    from app.core.agent.deep_agent_factory import TOOL_DISPLAY_NAMES
+    DEEP_DEFAULT_TOOLS = [
+        ("write_todos", "任务规划清单"), ("ls", "列出文件"),
+        ("read_file", "读取文件"), ("write_file", "写入文件"),
+        ("edit_file", "编辑文件"), ("glob", "按模式查找文件"),
+        ("grep", "内容搜索"), ("task", "子代理调度"),
+    ]
+    for tid, tdesc in DEEP_DEFAULT_TOOLS:
+        tools.append({
+            "id": tid, "name": tid, "description": tdesc,
+            "display_name": TOOL_DISPLAY_NAMES.get(tid, tid),
+        })
+
     return jsonify({
         "tools": tools, "skills": skills,
         "mcp_servers": mcp_servers, "knowledge_collections": kb_collections,
