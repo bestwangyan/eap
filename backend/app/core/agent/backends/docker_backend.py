@@ -1,0 +1,169 @@
+"""container 后端 — 一次性 Docker 容器沙箱（SandboxBackendProtocol）
+
+沙箱参数：--network none --memory 256m --cpus 1 --pids-limit 64
+文件持久化：宿主 root_dir 挂载到容器 /workspace
+镜像：python:3.12-slim（部署时预热）
+
+实现说明（与 brief 草案的偏差见 task-2-report）：
+继承 deepagents.backends.sandbox.BaseSandbox —— 其 ls/read/write/edit/
+grep/glob/delete 均以 python3 脚本经 execute() 在容器内执行（本镜像自带
+python3），并返回协议规定的结构化结果（LsResult/ReadResult/...）。本类
+只需实现四个原语：execute / upload_files / download_files / id。
+"""
+import subprocess
+from pathlib import Path
+
+from deepagents.backends.protocol import (
+    ExecuteResponse,
+    FileDownloadResponse,
+    FileUploadResponse,
+)
+from deepagents.backends.sandbox import BaseSandbox
+
+IMAGE = "python:3.12-slim"
+DEFAULT_EXECUTE_TIMEOUT = 120
+"""默认命令超时（秒）。对齐 deepagents LocalShellBackend 的默认值；
+brief 草案的 10s 对 pip install 等合法长命令过短，故取实测生态默认。"""
+WORKSPACE_MOUNT = "/workspace"
+"""宿主 root_dir 在容器内的挂载点。"""
+
+
+def _map_to_host(root_dir: Path, sandbox_path: str) -> Path | None:
+    """沙箱绝对路径（/workspace/...）→ 宿主 root_dir 内路径。
+
+    仅接受 /workspace 前缀的路径；resolve() 做词法归一（阻断 `..` 穿越）
+    并解析已存在父目录的符号链接，最终必须仍位于 root_dir 之内，
+    否则返回 None（fail-closed，拒绝宿主机逃逸）。
+    """
+    p = Path(sandbox_path).resolve()
+    ws = Path(WORKSPACE_MOUNT).resolve()
+    try:
+        rel = p.relative_to(ws)
+    except ValueError:
+        return None
+    host = (root_dir.resolve() / rel).resolve()
+    try:
+        host.relative_to(root_dir.resolve())
+    except ValueError:
+        return None
+    return host
+
+
+class DockerBackend(BaseSandbox):
+    """一次性容器沙箱：每次 execute 起一个 --rm 容器，文件经挂载持久化。"""
+
+    def __init__(self, root_dir: str):
+        # 构建时校验 Docker 可用 + 镜像存在（fail-closed 的第一道闸）
+        chk = subprocess.run(
+            ["docker", "version", "--format", "{{.Server.Version}}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if chk.returncode != 0:
+            raise RuntimeError(f"Docker 不可用: {chk.stderr.strip()}")
+        img = subprocess.run(
+            ["docker", "image", "inspect", IMAGE],
+            capture_output=True, text=True, timeout=10,
+        )
+        if img.returncode != 0:
+            raise RuntimeError(f"镜像 {IMAGE} 缺失，请先 docker pull")
+        self.root_dir = Path(root_dir)
+        self.root_dir.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def id(self) -> str:
+        return f"docker:{self.root_dir}"
+
+    def execute(
+        self,
+        command: str,
+        *,
+        timeout: int | None = None,
+    ) -> ExecuteResponse:
+        """容器内执行任意 shell 命令（cwd=/workspace），输出/退出码结构同
+        LocalShellBackend 约定，供 LLM 直接消费。"""
+        if not command or not isinstance(command, str):
+            return ExecuteResponse(
+                output="Error: Command must be a non-empty string.",
+                exit_code=1,
+                truncated=False,
+            )
+        effective_timeout = timeout if timeout is not None else DEFAULT_EXECUTE_TIMEOUT
+        if effective_timeout <= 0:
+            msg = f"timeout must be positive, got {effective_timeout}"
+            raise ValueError(msg)
+
+        cmd = [
+            "docker", "run", "--rm",
+            "--network", "none",
+            "--memory", "256m", "--cpus", "1", "--pids-limit", "64",
+            "-v", f"{self.root_dir}:{WORKSPACE_MOUNT}",
+            "-w", WORKSPACE_MOUNT,
+            IMAGE, "sh", "-c", command,
+        ]
+        try:
+            r = subprocess.run(
+                cmd,
+                capture_output=True, text=True,
+                stdin=subprocess.DEVNULL,  # 防止命令读 stdin 挂起
+                timeout=effective_timeout,
+            )
+        except subprocess.TimeoutExpired:
+            if timeout is not None:
+                msg = f"Error: Command timed out after {effective_timeout} seconds (custom timeout). The command may be stuck or require more time."
+            else:
+                msg = f"Error: Command timed out after {effective_timeout} seconds. For long-running commands, re-run using the timeout parameter."
+            return ExecuteResponse(output=msg, exit_code=124, truncated=False)
+        except Exception as e:  # noqa: BLE001
+            return ExecuteResponse(
+                output=f"Error executing command ({type(e).__name__}): {e}",
+                exit_code=1,
+                truncated=False,
+            )
+
+        out_parts = []
+        if r.stdout:
+            out_parts.append(r.stdout)
+        if r.stderr:
+            stderr_lines = r.stderr.strip().split("\n")
+            out_parts.extend(f"[stderr] {line}" for line in stderr_lines)
+        output = "\n".join(out_parts) if out_parts else "<no output>"
+        if r.returncode != 0:
+            output = f"{output.rstrip()}\n\nExit code: {r.returncode}"
+        return ExecuteResponse(output=output, exit_code=r.returncode, truncated=False)
+
+    def upload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
+        """写入宿主 root_dir（经挂载进入容器 /workspace 视角）。
+
+        仅接受 /workspace 前缀的绝对路径；越界路径返回 invalid_path，
+        绝不写入 root_dir 之外（防宿主机逃逸）。
+        """
+        responses = []
+        for path, content in files:
+            host = _map_to_host(self.root_dir, path)
+            if host is None:
+                responses.append(FileUploadResponse(path=path, error="invalid_path"))
+                continue
+            try:
+                host.parent.mkdir(parents=True, exist_ok=True)
+                host.write_bytes(content)
+                responses.append(FileUploadResponse(path=path))
+            except OSError as e:
+                responses.append(FileUploadResponse(path=path, error=str(e)))
+        return responses
+
+    def download_files(self, paths: list[str]) -> list[FileDownloadResponse]:
+        """从宿主 root_dir（/workspace 视角）读取文件字节。"""
+        responses = []
+        for path in paths:
+            host = _map_to_host(self.root_dir, path)
+            if host is None:
+                responses.append(FileDownloadResponse(path=path, error="invalid_path"))
+                continue
+            try:
+                content = host.read_bytes()
+                responses.append(FileDownloadResponse(path=path, content=content))
+            except FileNotFoundError:
+                responses.append(FileDownloadResponse(path=path, error="file_not_found"))
+            except OSError as e:
+                responses.append(FileDownloadResponse(path=path, error=str(e)))
+        return responses
