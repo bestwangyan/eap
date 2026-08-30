@@ -8,17 +8,21 @@ export function streamChat(
   callbacks: {
     onThreadId: (threadId: string) => void;
     onToken: (text: string) => void;
-    onToolStart: (toolName: string, input: string) => void;
+    onToolStart: (toolName: string, input: string, displayName?: string) => void;
     onToolEnd: (toolName: string, output: string) => void;
     onError: (error: string) => void;
     onGuardrail: (message: string) => void;
+    onInterrupt: (approvalId: number, toolName: string, args: Record<string, unknown>) => void;
     onDone: (meta?: { usage?: TokenUsage; traceId?: string }) => void;
-  }
+  },
+  resume = false
 ): AbortController {
   const controller = new AbortController();
   const token = localStorage.getItem('access_token');
 
-  const body: Record<string, unknown> = { message, thread_id: threadId };
+  // HITL 恢复：message 传空串 + resume: true（后端要求 resume 请求不得携带 message）
+  const body: Record<string, unknown> = { message: resume ? '' : message, thread_id: threadId };
+  if (resume) body.resume = true;
   if (modelProviderId) body.model_provider_id = modelProviderId;
   if (agentId) body.agent_id = agentId;
 
@@ -62,7 +66,7 @@ export function streamChat(
                   if (event.content) callbacks.onToken(event.content);
                   break;
                 case 'tool_start':
-                  callbacks.onToolStart(event.tool || 'unknown', event.input || '');
+                  callbacks.onToolStart(event.tool || 'unknown', event.input || '', event.display_name);
                   break;
                 case 'tool_end':
                   callbacks.onToolEnd(event.tool || 'unknown', event.output || '');
@@ -72,6 +76,11 @@ export function streamChat(
                   break;
                 case 'guardrail':
                   callbacks.onGuardrail(event.message || '触发安全拦截');
+                  break;
+                case 'interrupt':
+                  if (event.approval_id != null && event.tool_name) {
+                    callbacks.onInterrupt(event.approval_id, event.tool_name, event.args || {});
+                  }
                   break;
                 case 'done':
                   callbacks.onDone({ usage: event.usage, traceId: event.trace_id });

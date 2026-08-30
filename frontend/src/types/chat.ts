@@ -15,6 +15,8 @@ export interface ChatMessage {
   // 遥测数据（done 事件携带）：trace_id + token 用量
   traceId?: string;
   usage?: TokenUsage;
+  // 工具中文别名（tool_start 事件 display_name 字段）
+  displayName?: string;
 }
 
 export interface ChatThread {
@@ -29,7 +31,7 @@ export interface ChatThread {
 }
 
 export interface SSEEvent {
-  type: 'token' | 'tool_start' | 'tool_end' | 'error' | 'done' | 'thread_id' | 'guardrail';
+  type: 'token' | 'tool_start' | 'tool_end' | 'error' | 'done' | 'thread_id' | 'guardrail' | 'interrupt';
   content?: string;
   tool?: string;
   input?: string;
@@ -39,4 +41,12 @@ export interface SSEEvent {
   full_thread_id?: string;
   usage?: TokenUsage;
   trace_id?: string;
+  // HITL 审批（interrupt 事件）：approval_id / tool_name / args
+  approval_id?: number;
+  tool_name?: string;
+  args?: Record<string, unknown>;
+  // 工具中文别名（tool_start 事件）
+  display_name?: string;
+  // done 事件附加标志：中断轮（HITL 暂停）必带 interrupted: true
+  interrupted?: boolean;
 }

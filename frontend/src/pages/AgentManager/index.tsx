@@ -20,7 +20,7 @@ import type { AgentConfig } from '../../types/agent';
 const { Title, Text } = Typography;
 
 interface ResourceMap {
-  tools: { id: string; name: string; description: string }[];
+  tools: { id: string; name: string; description: string; display_name?: string }[];
   skills: { id: string; name: string; description: string }[];
   mcp_servers: { id: string; name: string; transport: string; description: string }[];
   knowledge_collections: { id: number; name: string; description: string }[];
@@ -260,7 +260,7 @@ export default function AgentManagerPage() {
           <Typography.Title level={5} style={{ marginTop: 8 }}>资源配置</Typography.Title>
 
           <Form.Item name="tools" label="可用工具">
-            <Checkbox.Group options={resources.tools.map(t => ({ label: `${t.name}: ${t.description}`, value: t.id }))} />
+            <Checkbox.Group options={resources.tools.map(t => ({ label: t.display_name ? `${t.display_name} (${t.name})` : `${t.name}: ${t.description}`, value: t.id }))} />
           </Form.Item>
 
           <Form.Item name="skills" label="绑定 Skill">
