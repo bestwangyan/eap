@@ -20,7 +20,7 @@ import type { AgentConfig } from '../../types/agent';
 const { Title, Text } = Typography;
 
 interface ResourceMap {
-  tools: { id: string; name: string; description: string; display_name?: string }[];
+  tools: { id: string; name: string; description: string; display_name?: string; builtin?: boolean }[];
   skills: { id: string; name: string; description: string }[];
   mcp_servers: { id: string; name: string; transport: string; description: string }[];
   knowledge_collections: { id: number; name: string; description: string }[];
@@ -259,8 +259,19 @@ export default function AgentManagerPage() {
 
           <Typography.Title level={5} style={{ marginTop: 8 }}>资源配置</Typography.Title>
 
-          <Form.Item name="tools" label="可用工具">
-            <Checkbox.Group options={resources.tools.map(t => ({ label: t.display_name ? `${t.display_name} (${t.name})` : `${t.name}: ${t.description}`, value: t.id }))} />
+          <Form.Item name="tools" label="可用工具"
+            tooltip="code_execution 可开关（映射 deepagents execute）；deepagents 内置文件工具恒启用，不可配置">
+            <Checkbox.Group
+              options={resources.tools.map(t => ({
+                value: t.id,
+                // deepagents 0.7.11 默认工具不可按名裁剪（tools_config 勾选无效）：
+                // 禁用态展示 + 始终启用提示（终审 B2 处置），code_execution 保持可选
+                disabled: t.builtin,
+                label: t.builtin
+                  ? `${t.display_name ?? t.name} (${t.name}) · deepagents 内置，始终启用`
+                  : t.display_name ? `${t.display_name} (${t.name})` : `${t.name}: ${t.description}`,
+              }))}
+            />
           </Form.Item>
 
           <Form.Item name="skills" label="绑定 Skill">

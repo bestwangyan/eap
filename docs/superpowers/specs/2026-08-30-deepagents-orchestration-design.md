@@ -65,7 +65,7 @@ deepagents 默认内置 9 个工具，与自有工具统一管理：
 | `task` | 子 agent 调度（替代 `sub_agent_x`） | 与 subagents 联动，默认开启 |
 
 - **现有 `code_execution` 工具退役**：宿主机 subprocess 执行与"local = 无 shell"的安全设定矛盾；其配置名保留，映射为 execute 开关。local 模式彻底无 shell，container 模式沙箱执行
-- **统一开关**：deepagents 默认工具加入 `/agents/resources` 资源列表与 Agent 表单勾选（默认全开）；`tools_config` 过滤逻辑扩展为"自有工具 ∪ deepagents 默认工具"统一过滤
+- **统一开关（终审 B2 能力限制）**：deepagents 默认工具加入 `/agents/resources` 资源列表与 Agent 表单展示（默认全开）。**deepagents 0.7.11 的默认文件工具不可按名裁剪 —— tools_config 勾选无效（恒启用）**；`tools_config` 仅对自有工具与 `code_execution`（→execute 开关）生效。前端资源列表对默认工具渲染为禁用态（builtin 标记 + "deepagents 内置，始终启用"提示），不再提供无效开关
 - **中文别名**：后端 tool_start 事件附加 `display_name` 字段（如 write_todos → 任务规划、read_file → 读取文件）；前端 ToolRow 优先展示 display_name，保留原名
 
 ## 5. 执行后端设计

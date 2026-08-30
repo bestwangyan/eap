@@ -653,6 +653,47 @@ else
   bad "H7f 文件内容不符（批次串味）: $(sse_reply "$F")"
 fi
 
+# H8: 终审 B1 回归 —— pending-放弃序列 → 新消息 → 新批中断 → 批准 → resume 成功
+# 批次1 中断后**不决议**（保持 pending）即放弃 → 同线程新消息（checkpoint 清理，
+# 旧批 pending 必须被 _orphan_abandoned_approvals 一并标记 orphaned）→ 批次2 中断 →
+# approve → resume 必须成功。修复前旧批 pending 残留使 pending_left 守卫恒真，
+# resume 永久报"仍有未处理的审批"死锁（前端无审批列表 UI 可清除）。
+F=$(interrupt_retry "h8_intr" "" "请把文件 hitl_pend.txt 的内容写为 batch-a（该文件还不存在，请直接写），写完后确认")
+if grep -q '"type": "interrupt"' "$F" 2>/dev/null; then
+  P1ID=$(sse_interrupt "$F" | jget "d['approval_id']")
+  ok "H8a 批次1 中断（approval_id=$P1ID，保持 pending 放弃不决议）"
+else
+  bad "H8a 批次1 未中断（3 次尝试模型仍未调用 write_file）: $(sse_error "$F")"
+fi
+TID_H8=$(sse_thread "$F")
+# 放弃批次1：不决议直接同线程发新消息（非 resume）→ checkpoint 清理 + 旧批 pending 标记 orphaned
+F=$(interrupt_retry "h8_intr2" "$TID_H8" "请把文件 hitl_pend.txt 的内容写为 batch-b（该文件还不存在，请直接写），写完后确认")
+if grep -q '"type": "interrupt"' "$F" 2>/dev/null; then
+  P2ID=$(sse_interrupt "$F" | jget "d['approval_id']")
+  if [ -n "$P2ID" ] && [ "$P2ID" != "$P1ID" ]; then
+    ok "H8b 批次2 中断产生新审批（id=$P2ID，与批次1 $P1ID 不同）"
+  else
+    bad "H8b 批次2 审批异常（未产生新审批）: $F"
+  fi
+else
+  bad "H8b 批次2 未中断（3 次尝试模型仍未调用 write_file）: $(sse_error "$F")"
+fi
+S=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$BASE/workflow/approvals/$P2ID/approve" -H "Authorization: Bearer $ATOKEN")
+[ "$S" = "200" ] && ok "H8c 批次2 approve（200）" || bad "H8c 批次2 approve 应 200, 实际 $S"
+F=$(resume $HITL_AID "$TID_H8" h8_resume)
+# 回归核心：resume 必须成功（旧批 pending 已 orphaned，不得报"仍有未处理的审批"死锁）
+if grep -q '"type": "tool_end", "tool": "write_file"' "$F" && sse_ok "$F"; then
+  ok "H8d resume 成功（旧批 pending 已放弃，write_file 执行 + done）"
+else
+  bad "H8d resume 失败/死锁（旧批 pending 未清理）: $(sse_tools "$F" | tr '\n' ' ') $(sse_error "$F")"
+fi
+F=$(chat $HITL_AID "请用 read_file 读取 hitl_pend.txt 并原样回复其中的内容" "$TID_H8" h8_verify)
+if sse_ok "$F" && sse_reply "$F" | grep -q "batch-b"; then
+  ok "H8e 文件内容为批次2 的 batch-b（旧批 pending 不影响新批执行）"
+else
+  bad "H8e 文件内容不符（批次串味）: $(sse_reply "$F")"
+fi
+
 # ================= Phase E: 线程列表 + 清理 =================
 echo ""
 echo "【Phase E】线程与清理"
