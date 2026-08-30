@@ -102,6 +102,11 @@ class DeepAgentFactory:
         create_deep_agent 自动追加，不在此列；execute 由 backend 变体
         控制（tools_config 含 code_execution → 完整 DockerBackend，
         否则 DockerBackendNoShell → 模型请求无 execute）。
+
+        能力限制（终审 B2）：deepagents 0.7.11 的默认文件工具**恒启用、
+        不可按名裁剪** —— tools_config 勾选仅对自有工具与 code_execution
+        （→execute 开关）生效；前端资源列表对默认工具作禁用态展示
+        （builtin 标记 + "始终启用"提示）。
         """
         agent = None
         skills, subagents, interrupt_on, backend_mode = [], [], [], "local"

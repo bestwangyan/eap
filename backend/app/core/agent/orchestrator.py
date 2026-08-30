@@ -143,33 +143,37 @@ def _cleanup_stale_checkpoint(checkpointer, thread_id: str) -> None:
         logger.debug(f"Stale checkpoint check skipped: {e}")
 
 
-def _orphan_abandoned_approvals(thread_id: str) -> int:
-    """新消息路径：把该线程所有未消费的已决议审批标记为 orphaned。
+def _orphan_abandoned_approvals(tenant_id: str, thread_id: str) -> int:
+    """新消息路径：把该线程所有未消费的审批标记为 orphaned（终审 B1 修复）。
 
-    场景（review Minor 5 / Important 1）：批次 1 中断 → 审批已决议
-    （approved/rejected）但用户未 resume，转而发新消息 —— 中断态
-    checkpoint 被清理，批次 1 的审批成为孤儿。若不加标记，后续批次 2
-    的 resume 查询会把这些旧决议混入 decisions，与当前批次的
-    action_requests 一一对应时错配。此处统一标记为 orphaned，
-    使旧批次不再参与未来 resume 查询（_build_resume_command 只读
-    approved/rejected；workflow API 的 pending 守卫天然兼容）。
+    场景（review Minor 5 / Important 1 / 终审 B1）：批次 1 中断 → 用户
+    未 resume（审批可能已决议 approved/rejected，也可能仍 pending 未处理）
+    转而发新消息 —— 中断态 checkpoint 被清理，批次 1 的审批成为孤儿。
+    若不标记，后续批次 2 的 resume 查询会混入旧数据：已决议行错配
+    decisions（Important 1），pending 行触发 _build_resume_command 的
+    pending_left 守卫报"仍有未处理的审批"（B1 —— 前端无审批列表 UI，
+    该错误永久阻塞 resume，死锁）。此处统一标记为 orphaned，使旧批次
+    不再参与未来 resume 查询。
 
-    仅标记"已决议"行（approved/rejected）：pending 行仍保留在审批
-    列表中供用户处理。幂等：仅处理未消费行，consumed(resumed) 不触碰。
+    终审 B1 修复点：status 过滤从 ("approved", "rejected") 扩展为
+    ("pending", "approved", "rejected") —— pending 行的审计记录保留
+    （status=orphaned），但不再计入 pending_left 守卫。随批附加
+    tenant_id 过滤（终审 T5 项）。幂等：仅处理未消费行，resumed 不触碰。
 
     返回标记行数。
     """
     try:
         rows = ApprovalRequest.query.filter(
+            ApprovalRequest.tenant_id == int(tenant_id),
             ApprovalRequest.thread_id == thread_id,
-            ApprovalRequest.status.in_(("approved", "rejected")),
+            ApprovalRequest.status.in_(("pending", "approved", "rejected")),
         ).all()
         for r in rows:
             r.status = "orphaned"
         if rows:
             db.session.commit()
             logger.info(
-                "HITL abandon: orphaned %d resolved approval(s) for thread %s",
+                "HITL abandon: orphaned %d unconsumed approval(s) for thread %s",
                 len(rows), thread_id)
         return len(rows)
     except Exception as e:
@@ -763,13 +767,14 @@ class AgentOrchestrator:
             except Exception as e:
                 logger.warning(f"Guardrail check failed in orchestrator (fail-open): {e}")
 
-        # 新消息通过围栏、确认继续 → 把该线程未消费的已决议审批标记为
-        # orphaned（review Minor 5）：此前批次已审批但用户放弃 resume
-        # 转而发新消息，中断态 checkpoint 将随流继续被清理，旧决议不得
-        # 混入未来批次的 resume decisions。放在围栏之后：消息被拦截时
-        # 不清除任何审批，批次仍可正常 resume。
+        # 新消息通过围栏、确认继续 → 把该线程未消费的审批标记为
+        # orphaned（review Minor 5 + 终审 B1）：此前批次已审批但用户放弃
+        # resume（或 pending 未处理）转而发新消息，中断态 checkpoint 将
+        # 随流继续被清理，旧决议不得混入未来批次的 resume decisions，
+        # 旧 pending 也不得阻塞新批次的 pending_left 守卫（B1 死锁）。
+        # 放在围栏之后：消息被拦截时不清除任何审批，批次仍可正常 resume。
         if not resume:
-            _orphan_abandoned_approvals(thread_id)
+            _orphan_abandoned_approvals(tenant_id, thread_id)
 
         try:
             # ------------------------------------------------------------------
@@ -1033,7 +1038,16 @@ class AgentOrchestrator:
                 logger.info(
                     "HITL interrupt: thread=%s tool=%s approval_id=%s",
                     thread_id, tool_name, appr.id)
-                yield f"data: {json.dumps({'type': 'interrupt', 'approval_id': appr.id, 'tool_name': tool_name, 'args': tool_args}, ensure_ascii=False)}\n\n"
+                # args 截断（终审卫生项）：对齐 tool_end 的 500 字符限制，
+                # 防超长参数（如 edit_file 全文改写）撑爆 SSE 事件。短参数
+                # 保持 dict 原样下发（前端审批卡与 edit 路径依赖 dict 形态）；
+                # 序列化超限时才退化为截断 JSON 字符串。
+                args_json = json.dumps(tool_args, ensure_ascii=False)
+                if len(args_json) > 500:
+                    evt_args: object = args_json[:500] + "…(截断)"
+                else:
+                    evt_args = tool_args
+                yield f"data: {json.dumps({'type': 'interrupt', 'approval_id': appr.id, 'tool_name': tool_name, 'args': evt_args}, ensure_ascii=False)}\n\n"
         elif interrupted:
             # 有活跃中断但 action_requests 为空/畸形（落库数 0）：
             # 视为异常记录日志；done 仍带 interrupted 标志（见上）

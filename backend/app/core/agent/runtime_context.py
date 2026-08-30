@@ -49,9 +49,10 @@ def get_knowledge_collection_ids() -> list:
 
 def get_backend() -> str:
     """
-    返回 Agent 配置的执行后端: "local"（默认，宿主机受限执行）| "container"（预留）。
+    返回 Agent 配置的执行后端: "local" | "container"。
 
-    预留接口：后续实现 Docker 容器沙箱时，code_execution 等工具通过本函数
-    感知执行环境，无需再改编排器调用链。
+    Docker 容器沙箱已实现（backends/docker_backend.py，--cap-drop ALL 一次性
+    容器），后端在编译期烘焙进 deepagents 图（deep_agent_factory.build →
+    build_backend）；本函数供工具侧感知执行环境。
     """
     return _backend.get()

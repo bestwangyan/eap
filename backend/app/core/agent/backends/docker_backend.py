@@ -1,6 +1,6 @@
 """container 后端 — 一次性 Docker 容器沙箱（SandboxBackendProtocol）
 
-沙箱参数：--network none --memory 256m --cpus 1 --pids-limit 64
+沙箱参数：--network none --memory 256m --cpus 1 --pids-limit 64 --cap-drop ALL
 文件持久化：宿主 root_dir 挂载到容器 /workspace
 镜像：python:3.12-slim（部署时预热）
 
@@ -109,19 +109,25 @@ class DockerBackend(BaseSandbox):
             msg = f"timeout must be positive, got {effective_timeout}"
             raise ValueError(msg)
 
-        # 每次执行用唯一 cidfile 记录容器 ID（root_dir 内点文件，容器内 ls 不可见），
-        # 超时挂起时凭它精确 `docker rm -f` 强杀容器 —— --rm 只在容器进程自行
-        # 退出后清理，挂起命令（如 `sleep infinity`，LLM 提示注入可构造）否则
-        # 会永久泄漏容器（每个 256m）。
-        cidfile = self.root_dir / f".eap-cid-{uuid.uuid4().hex}"
+        # 每次执行用唯一 cidfile 记录容器 ID。cidfile 写到 root_dir **之外**
+        # （root_dir.parent）—— root_dir 整体 bind-mount 为容器 /workspace，
+        # 放挂载内会被容器内命令删除/篡改（如 `rm /workspace/.eap-*`），
+        # 导致超时挂起时无法凭它精确 `docker rm -f` 强杀容器而泄漏（终审
+        # B3 修复）。uuid 命名防并发执行互相覆盖。--rm 只在容器进程自行
+        # 退出后清理，挂起命令（如 `sleep infinity`，LLM 提示注入可构造）
+        # 否则会永久泄漏容器（每个 256m）。
+        cidfile = self.root_dir.parent / f".eap-cid-{uuid.uuid4().hex}"
         # --mount 而非 -v：线程工作目录含平台线程 id（`{tenant_slug}:{user_id}:{uuid}`，
         # 如 default:1:1bb19970-...），-v 的 `host:container` 语法会按冒号切分 →
         # "too many colons"；--mount 按逗号切分 key=value，src 中的冒号安全。
+        # --cap-drop ALL（终审硬化）：容器只需文件 IO（挂载写入）与 python3，
+        # 剥离全部 Linux capability 收窄注入面。
         cmd = [
             "docker", "run", "--rm",
             "--cidfile", str(cidfile),
             "--network", "none",
             "--memory", "256m", "--cpus", "1", "--pids-limit", "64",
+            "--cap-drop", "ALL",
             "--mount", f"type=bind,src={self.root_dir},dst={WORKSPACE_MOUNT}",
             "-w", WORKSPACE_MOUNT,
             IMAGE, "sh", "-c", command,
@@ -164,10 +170,10 @@ class DockerBackend(BaseSandbox):
         """超时兜底：`docker rm -f` 强杀仍挂起的容器，防止资源泄漏。
 
         仅按 cidfile 内容精确删除本命令对应的容器：容器 ID 必须是 docker
-        写入的完整 64 位 hex ID（不信任任何 shell 拼接）；root_dir 会挂载进
-        容器，cidfile 理论上可能被容器内命令篡改，故内容不合规时拒绝删除
-        （fail-closed，绝不误删其他容器）。删除失败时静默放弃 —— 主路径
-        已返回超时错误，后续 --rm 语义不受影响。
+        写入的完整 64 位 hex ID（不信任任何 shell 拼接）。cidfile 位于
+        root_dir 之外（终审 B3 修复：写挂载外，容器内命令无法触碰），
+        内容不合规时仍拒绝删除（fail-closed，绝不误删其他容器）。删除
+        失败时静默放弃 —— 主路径已返回超时错误，后续 --rm 语义不受影响。
         """
         try:
             cid = cidfile.read_text().strip()

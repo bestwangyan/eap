@@ -30,18 +30,22 @@ def list_resources():
     kb_collections = [{"id": c.id, "name": c.name, "description": c.description}
                       for c in KnowledgeCollection.query.filter_by(tenant_id=g.tenant_id).all()]
 
-    # deepagents 默认工具（统一开关：默认全开）
+    # deepagents 默认工具（终审 B2 处置：非开关，仅展示）
+    # deepagents 0.7.11 的默认工具不可按名裁剪 —— tools_config 勾选无效
+    # （恒启用），前端据此渲染为禁用态 + "始终启用"提示；真正可开关的
+    # 只有自有工具与 code_execution（→execute，见 deep_agent_factory）。
     from app.core.agent.deep_agent_factory import TOOL_DISPLAY_NAMES
     DEEP_DEFAULT_TOOLS = [
         ("write_todos", "任务规划清单"), ("ls", "列出文件"),
         ("read_file", "读取文件"), ("write_file", "写入文件"),
-        ("edit_file", "编辑文件"), ("glob", "按模式查找文件"),
-        ("grep", "内容搜索"), ("task", "子代理调度"),
+        ("edit_file", "编辑文件"), ("delete", "删除文件"),
+        ("glob", "按模式查找文件"), ("grep", "内容搜索"), ("task", "子代理调度"),
     ]
     for tid, tdesc in DEEP_DEFAULT_TOOLS:
         tools.append({
             "id": tid, "name": tid, "description": tdesc,
             "display_name": TOOL_DISPLAY_NAMES.get(tid, tid),
+            "builtin": True,
         })
 
     return jsonify({
