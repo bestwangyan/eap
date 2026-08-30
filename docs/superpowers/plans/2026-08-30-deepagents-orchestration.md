@@ -105,8 +105,9 @@ from langgraph.checkpoint.postgres import PostgresSaver
 import psycopg_pool
 import os
 
+# DATABASE_URL 来自 .env（load_dotenv 已加载，真实密码不内联）
 pool = psycopg_pool.ConnectionPool(
-    "postgresql://eap:eap_dev_2024@127.0.0.1:5432/eap".replace("eap_dev_2024", os.getenv("EAP_DB_PW", "")),
+    os.getenv("DATABASE_URL", ""),
     min_size=1, max_size=2, open=True, timeout=10)
 checkpointer = PostgresSaver(pool)
 
@@ -136,7 +137,7 @@ asyncio.run(main())
 ```bash
 scp backend/scripts/spike_deepagents.py wangyan@192.168.1.51:/tmp/
 sshpass -p "$SSH_PASSWORD" ssh -o StrictHostKeyChecking=no wangyan@192.168.1.51 \
-  'cd /home/wangyan/deploy/eap/backend && EAP_DB_PW=eap_dev_2024 PYTHONPATH=. .venv/bin/python /tmp/spike_deepagents.py 2>&1 | grep -v DeprecationWarning | head -40'
+  'cd /home/wangyan/deploy/eap/backend && PYTHONPATH=. .venv/bin/python /tmp/spike_deepagents.py 2>&1 | grep -v DeprecationWarning | head -40'
 ```
 
 Expected: 打印协议方法签名 + create_deep_agent 签名 + MSG chunk 逐 token + UPDATE 节点结构与消息类型。**将输出抄录到本计划文档附录**（Task 3/5 的映射代码以实测形状为准；若 updates 含 `write`/`execute`/`task` 等子节点名，映射层按节点名路由 tool 事件）。
