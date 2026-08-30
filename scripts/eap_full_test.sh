@@ -49,6 +49,28 @@ sse_error()   { grep -oE '"type": "error".*' "$1" | head -1; }
 sse_thread()  { grep -oE '"thread_id": "[^"]+"' "$1" | head -1 | sed 's/.*: "//;s/"//'; }
 sse_tools()   { grep -oE '"type": "tool_start", "tool": "[^"]+"' "$1" | sed 's/.*"tool": "//'; }
 sse_reply()   { grep -oE '"type": "token", "content": "[^"]*"' "$1" | sed 's/.*"content": "//;s/"$//' | tr -d '\n' | head -c 300; }
+sse_full_thread() { grep -oE '"full_thread_id": "[^"]+"' "$1" | head -1 | sed 's/.*"full_thread_id": "//;s/"//'; }
+# 第一条 interrupt 事件（整行 JSON）
+sse_interrupt() { python3 -c "
+import sys, json
+for line in open(sys.argv[1], encoding='utf-8'):
+    if line.startswith('data: '):
+        try: d = json.loads(line[6:])
+        except Exception: continue
+        if d.get('type') == 'interrupt':
+            print(json.dumps(d, ensure_ascii=False)); break
+" "$1"; }
+
+# HITL 恢复: resume <agent_id> <thread_id> <文件名> → SSE 事件文件路径
+# 恢复值来自该线程已决议的审批（approve/reject/edit），message 为空
+resume() {
+    local aid="$1" tid="$2" f="$OUT/sse_${3:-resume}.txt"
+    curl -sN -X POST "$BASE/chat/stream" -H "Authorization: Bearer $ATOKEN" \
+      -H "Content-Type: application/json" \
+      -d "{\"resume\":true,\"thread_id\":\"$tid\",\"agent_id\":$aid}" \
+      --max-time 150 > "$f" 2>&1
+    echo "$f"
+}
 
 echo "=========================================="
 echo "EAP 全功能测试  $(date '+%F %T')"
@@ -438,6 +460,240 @@ TOOLC=$(echo "$R2" | jget "d.get('summary',{}).get('tool_calls',0)")
 if [ "$TOOLC" -ge 1 ]; then ok "D6 Trace 含工具事件（$TOOLC 次）"; else warn "D6 最近 trace 无工具事件（可能选了无工具的对话）"; fi
 if [ "$TOT" -gt 0 ]; then ok "D7 Token 统计正常（$TOT tokens）"; else bad "D7 Token 统计为 0"; fi
 
+# ================= Phase H: HITL 审批流转（interrupt → 审批 → resume） =================
+echo ""
+echo "【Phase H】HITL 审批流转（write_file 中断 → 审批 → resume）"
+
+# 专用 HITL agent（local 后端即有 write_file/edit_file；permission_mode=default → 中断）
+R=$(curl -s -X POST "$BASE/agents" -H "Authorization: Bearer $ATOKEN" -H "Content-Type: application/json" -d '{
+  "name":"ft_hitl","description":"HITL 回归测试 agent",
+  "model":"deepseek-v4-pro",
+  "system_prompt":"你是文件操作助手：按用户要求用 write_file 写入指定文件，写完后用一句话确认文件名。",
+  "tools_config":["calculator"],
+  "permission_mode":"default"}')
+HITL_AID=$(echo "$R" | jget "d.get('agent',{}).get('id')")
+[ -n "$HITL_AID" ] && ok "H0 创建 HITL agent" || bad "H0 创建 HITL agent: $R"
+
+# H1: 触发中断 —— 应发射 interrupt 事件（approval_id/tool_name/args），
+# 无 tool_end；done 带 interrupted 标志（review Important 2）
+F=$(chat $HITL_AID "请把文件 hitl_approve.txt 的内容写为 hello hitl approve 1024，写完后确认" "" h1_intr)
+if grep -q '"type": "interrupt"' "$F"; then
+  H1_AID=$(sse_interrupt "$F" | jget "d['approval_id']")
+  H1_TOOL=$(sse_interrupt "$F" | jget "d['tool_name']")
+  [ "$H1_TOOL" = "write_file" ] && ok "H1 write_file 触发中断（approval_id=$H1_AID）" || bad "H1 中断工具名异常: $H1_TOOL"
+else
+  bad "H1 未收到 interrupt 事件: $(sse_error "$F")"
+fi
+# H1b: 中断轮发 done 且带 interrupted 标志（review Important 2：usage 供
+# 成本入账；事件类型仍为 done，前端兼容）；不允许出现无标志 done
+grep -q '"type": "done", "interrupted": true' "$F" && ok "H1b 中断轮 done 带 interrupted 标志" || bad "H1b 中断轮 done 缺 interrupted 标志: $(grep -oE '"type": "done".*' "$F" | head -1)"
+grep -q '"type": "tool_end", "tool": "write_file"' "$F" && bad "H1c 中断时工具未执行" || ok "H1c 中断时工具未执行（无 tool_end）"
+TID_H1=$(sse_thread "$F")
+FULL_TID_H1=$(sse_full_thread "$F")
+
+# H2: 审批列表出现 pending 记录（与 interrupt 事件的 approval_id 一致）
+R=$(curl -s "$BASE/workflow/approvals?status=pending" -H "Authorization: Bearer $ATOKEN")
+HPEND=$(echo "$R" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+for a in d.get('approvals', []):
+    if a['thread_id'] == '$FULL_TID_H1' and a['tool_name'] == 'write_file':
+        print(a['id']); break")
+if [ -n "$HPEND" ] && [ "$HPEND" = "$H1_AID" ]; then
+  ok "H2 审批列表出现 pending 记录（id=$HPEND 与中断事件一致）"
+else
+  bad "H2 pending 审批缺失或不一致: $R"
+fi
+
+# H3: approve
+S=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$BASE/workflow/approvals/$HPEND/approve" -H "Authorization: Bearer $ATOKEN")
+[ "$S" = "200" ] && ok "H3 approve 审批（200）" || bad "H3 approve 应 200, 实际 $S"
+
+# H4: resume → 工具执行 + done
+F=$(resume $HITL_AID "$TID_H1" h4_resume)
+if grep -q '"type": "tool_end", "tool": "write_file"' "$F" && sse_ok "$F"; then
+  ok "H4 resume 后 write_file 执行并 done"
+else
+  bad "H4 resume 未执行工具: $(sse_tools "$F" | tr '\n' ' ') $(sse_error "$F")"
+fi
+
+# H4b: approve 路径文件内容验证（同一线程追问 read_file 读回）
+F=$(chat $HITL_AID "请用 read_file 读取 hitl_approve.txt 并原样回复其中的内容" "$TID_H1" h4_verify)
+if sse_ok "$F" && sse_reply "$F" | grep -q "1024"; then
+  ok "H4b approve 路径文件内容已写入（读回含 1024）"
+else
+  bad "H4b 文件内容读回不符: $(sse_reply "$F")"
+fi
+
+# H5: reject 路径 —— 中断 → reject → resume：工具跳过，注入拒绝说明
+F=$(chat $HITL_AID "请把文件 hitl_reject.txt 的内容写为 top secret，写完后确认" "" h5_intr)
+if grep -q '"type": "interrupt"' "$F"; then
+  RID=$(sse_interrupt "$F" | jget "d['approval_id']")
+  ok "H5 前置中断（approval_id=$RID）"
+else
+  bad "H5 未收到中断: $(sse_error "$F")"
+fi
+TID_H5=$(sse_thread "$F")
+S=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$BASE/workflow/approvals/$RID/reject" -H "Authorization: Bearer $ATOKEN" -H "Content-Type: application/json" -d '{"reason":"回归测试拒绝"}')
+[ "$S" = "200" ] && ok "H5b reject 审批（200）" || bad "H5b reject 应 200, 实际 $S"
+F=$(resume $HITL_AID "$TID_H5" h5_resume)
+# reject 时中间件注入 ToolMessage(status=error, "User rejected the tool call ... was not executed")，
+# 工具不执行 → tool_end 的 output 必含 rejected 标记
+if sse_ok "$F" && grep -q '"type": "tool_end", "tool": "write_file"' "$F" && grep -qi "rejected" "$F"; then
+  ok "H5c reject 后工具跳过（注入拒绝说明，无实际执行）"
+else
+  bad "H5c reject 路径异常: $(grep -oE '"type": "tool_end".*' "$F" | head -1) $(sse_error "$F")"
+fi
+
+# H6: edit 路径 —— 中断 → edit_and_approve（改 content）→ resume：按编辑后的参数执行
+F=$(chat $HITL_AID "请把文件 hitl_edit.txt 的内容写为 original content" "" h6_intr)
+if grep -q '"type": "interrupt"' "$F"; then
+  EID=$(sse_interrupt "$F" | jget "d['approval_id']")
+  ok "H6 前置中断（approval_id=$EID）"
+else
+  bad "H6 未收到中断: $(sse_error "$F")"
+fi
+TID_H6=$(sse_thread "$F")
+# 从 interrupt 事件的原始 args 上改 content，保证工具参数完整
+EEDITED=$(sse_interrupt "$F" | python3 -c "
+import sys, json
+d = json.loads(sys.stdin.read())
+a = dict(d['args']); a['content'] = 'edited-by-test'
+print(json.dumps(a, ensure_ascii=False))")
+S=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$BASE/workflow/approvals/$EID/edit" -H "Authorization: Bearer $ATOKEN" -H "Content-Type: application/json" -d "{\"edited_args\":$EEDITED}")
+[ "$S" = "200" ] && ok "H6b edit_and_approve（200）" || bad "H6b edit 应 200, 实际 $S"
+F=$(resume $HITL_AID "$TID_H6" h6_resume)
+# 编辑后的参数必须生效：tool_start 的 input 含 edited-by-test，且工具已执行
+if grep -q '"input": ".*edited-by-test' "$F" && grep -q '"type": "tool_end", "tool": "write_file"' "$F"; then
+  ok "H6c 编辑后的参数生效并执行（input 含 edited-by-test）"
+else
+  bad "H6c 编辑参数未生效: $(grep -oE '"type": "tool_start".*' "$F" | head -1) $(sse_error "$F")"
+fi
+# 中间件不回显编辑后的内容 → 模型可能再次发起写入 → 链式中断（每笔写入都需审批）：
+# 新审批 → approve → resume → done
+if grep -q '"type": "interrupt"' "$F"; then
+  EID2=$(sse_interrupt "$F" | jget "d['approval_id']")
+  if [ -n "$EID2" ] && [ "$EID2" != "$EID" ]; then
+    ok "H6c2 链式中断产生新审批（id=$EID2，与编辑审批 $EID 不同）"
+  else
+    bad "H6c2 链式中断审批异常: $F"
+  fi
+  S=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$BASE/workflow/approvals/$EID2/approve" -H "Authorization: Bearer $ATOKEN")
+  [ "$S" = "200" ] && ok "H6c3 链式审批 approve（200）" || bad "H6c3 链式 approve 应 200, 实际 $S"
+  F=$(resume $HITL_AID "$TID_H6" h6_resume2)
+  sse_ok "$F" && ok "H6c4 链式 resume 完成（done）" || bad "H6c4 链式 resume: $(sse_error "$F")"
+else
+  sse_ok "$F" && ok "H6c2 恢复流一次完成（无链式中断）" || bad "H6c2 恢复流未 done: $(sse_error "$F")"
+fi
+
+# H6d: 文件内容读回（无链式时 = edited-by-test；链式复写后 = original content，均为编辑流合法终点）
+F=$(chat $HITL_AID "请用 read_file 读取 hitl_edit.txt 并原样回复其中的内容" "$TID_H6" h6_verify)
+if sse_ok "$F" && (sse_reply "$F" | grep -q "edited-by-test" || sse_reply "$F" | grep -q "original content"); then
+  ok "H6d 文件内容读回一致（$(sse_reply "$F" | grep -oE 'edited-by-test|original content' | head -1)）"
+else
+  bad "H6d 读回内容不符: $(sse_reply "$F")"
+fi
+
+# 触发 HITL 中断：模型有时先探索目录而不调用 write_file（非确定性），
+# 最多重试 3 次，后续尝试明确要求直接调用 write_file（同线程续聊）
+interrupt_retry() {
+    local out="$1" tid="${2:-}" base_msg="$3"
+    local f="" t=""
+    for i in 1 2 3; do
+        if [ "$i" = "1" ]; then
+            f=$(chat $HITL_AID "$base_msg" "$tid" "${out}_$i")
+        else
+            t=$(sse_thread "$f")
+            f=$(chat $HITL_AID "不要查找/探索目录，请直接调用 write_file 工具执行：$base_msg" "$t" "${out}_$i")
+        fi
+        grep -q '"type": "interrupt"' "$f" && { echo "$f"; return 0; }
+    done
+    echo "$f"
+    return 1
+}
+
+# H7: review Important-1 回归 —— 审批后放弃 → 新消息 → 再次中断 → 审批 → resume
+# 决定不串：批次1 已 approve 但放弃（不 resume，改发新消息）→ 批次2 新中断 →
+# approve 批次2 → resume 必须成功，且执行的是批次2 的写入（旧决议不得混入）
+F=$(interrupt_retry "h7_intr" "" "请把文件 hitl_abandon.txt 的内容写为 batch-one（该文件还不存在，请直接写），写完后确认")
+if grep -q '"type": "interrupt"' "$F" 2>/dev/null; then
+  B1ID=$(sse_interrupt "$F" | jget "d['approval_id']")
+  ok "H7a 批次1 中断（approval_id=$B1ID）"
+else
+  bad "H7a 批次1 未中断（3 次尝试模型仍未调用 write_file）: $(sse_error "$F")"
+fi
+TID_H7=$(sse_thread "$F")
+S=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$BASE/workflow/approvals/$B1ID/approve" -H "Authorization: Bearer $ATOKEN")
+[ "$S" = "200" ] && ok "H7b 批次1 approve（200，随后放弃不 resume）" || bad "H7b 批次1 approve 应 200, 实际 $S"
+# 放弃批次1：同线程发新消息（非 resume）→ checkpoint 清理 + 旧决议标记 orphaned
+F=$(interrupt_retry "h7_intr2" "$TID_H7" "请把文件 hitl_abandon.txt 的内容写为 batch-two（该文件还不存在，请直接写），写完后确认")
+if grep -q '"type": "interrupt"' "$F" 2>/dev/null; then
+  B2ID=$(sse_interrupt "$F" | jget "d['approval_id']")
+  if [ -n "$B2ID" ] && [ "$B2ID" != "$B1ID" ]; then
+    ok "H7c 批次2 中断产生新审批（id=$B2ID，与批次1 $B1ID 不同）"
+  else
+    bad "H7c 批次2 审批异常（未产生新审批）: $F"
+  fi
+else
+  bad "H7c 批次2 未中断（3 次尝试模型仍未调用 write_file）: $(sse_error "$F")"
+fi
+S=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$BASE/workflow/approvals/$B2ID/approve" -H "Authorization: Bearer $ATOKEN")
+[ "$S" = "200" ] && ok "H7d 批次2 approve（200）" || bad "H7d 批次2 approve 应 200, 实际 $S"
+F=$(resume $HITL_AID "$TID_H7" h7_resume)
+# 回归核心：resume 成功（旧批次决定不得混入/不得报"决议数不足"卡死）
+if grep -q '"type": "tool_end", "tool": "write_file"' "$F" && sse_ok "$F"; then
+  ok "H7e resume 成功，批次1 决议未混入（write_file 执行 + done）"
+else
+  bad "H7e resume 失败/决定串批: $(sse_tools "$F" | tr '\n' ' ') $(sse_error "$F")"
+fi
+F=$(chat $HITL_AID "请用 read_file 读取 hitl_abandon.txt 并原样回复其中的内容" "$TID_H7" h7_verify)
+if sse_ok "$F" && sse_reply "$F" | grep -q "batch-two"; then
+  ok "H7f 文件内容为批次2 的 batch-two（决定不串）"
+else
+  bad "H7f 文件内容不符（批次串味）: $(sse_reply "$F")"
+fi
+
+# H8: 终审 B1 回归 —— pending-放弃序列 → 新消息 → 新批中断 → 批准 → resume 成功
+# 批次1 中断后**不决议**（保持 pending）即放弃 → 同线程新消息（checkpoint 清理，
+# 旧批 pending 必须被 _orphan_abandoned_approvals 一并标记 orphaned）→ 批次2 中断 →
+# approve → resume 必须成功。修复前旧批 pending 残留使 pending_left 守卫恒真，
+# resume 永久报"仍有未处理的审批"死锁（前端无审批列表 UI 可清除）。
+F=$(interrupt_retry "h8_intr" "" "请把文件 hitl_pend.txt 的内容写为 batch-a（该文件还不存在，请直接写），写完后确认")
+if grep -q '"type": "interrupt"' "$F" 2>/dev/null; then
+  P1ID=$(sse_interrupt "$F" | jget "d['approval_id']")
+  ok "H8a 批次1 中断（approval_id=$P1ID，保持 pending 放弃不决议）"
+else
+  bad "H8a 批次1 未中断（3 次尝试模型仍未调用 write_file）: $(sse_error "$F")"
+fi
+TID_H8=$(sse_thread "$F")
+# 放弃批次1：不决议直接同线程发新消息（非 resume）→ checkpoint 清理 + 旧批 pending 标记 orphaned
+F=$(interrupt_retry "h8_intr2" "$TID_H8" "请把文件 hitl_pend.txt 的内容写为 batch-b（该文件还不存在，请直接写），写完后确认")
+if grep -q '"type": "interrupt"' "$F" 2>/dev/null; then
+  P2ID=$(sse_interrupt "$F" | jget "d['approval_id']")
+  if [ -n "$P2ID" ] && [ "$P2ID" != "$P1ID" ]; then
+    ok "H8b 批次2 中断产生新审批（id=$P2ID，与批次1 $P1ID 不同）"
+  else
+    bad "H8b 批次2 审批异常（未产生新审批）: $F"
+  fi
+else
+  bad "H8b 批次2 未中断（3 次尝试模型仍未调用 write_file）: $(sse_error "$F")"
+fi
+S=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$BASE/workflow/approvals/$P2ID/approve" -H "Authorization: Bearer $ATOKEN")
+[ "$S" = "200" ] && ok "H8c 批次2 approve（200）" || bad "H8c 批次2 approve 应 200, 实际 $S"
+F=$(resume $HITL_AID "$TID_H8" h8_resume)
+# 回归核心：resume 必须成功（旧批 pending 已 orphaned，不得报"仍有未处理的审批"死锁）
+if grep -q '"type": "tool_end", "tool": "write_file"' "$F" && sse_ok "$F"; then
+  ok "H8d resume 成功（旧批 pending 已放弃，write_file 执行 + done）"
+else
+  bad "H8d resume 失败/死锁（旧批 pending 未清理）: $(sse_tools "$F" | tr '\n' ' ') $(sse_error "$F")"
+fi
+F=$(chat $HITL_AID "请用 read_file 读取 hitl_pend.txt 并原样回复其中的内容" "$TID_H8" h8_verify)
+if sse_ok "$F" && sse_reply "$F" | grep -q "batch-b"; then
+  ok "H8e 文件内容为批次2 的 batch-b（旧批 pending 不影响新批执行）"
+else
+  bad "H8e 文件内容不符（批次串味）: $(sse_reply "$F")"
+fi
+
 # ================= Phase E: 线程列表 + 清理 =================
 echo ""
 echo "【Phase E】线程与清理"
@@ -454,6 +710,7 @@ curl -s -X DELETE "$BASE/skills/$SK2" -H "Authorization: Bearer $ATOKEN" > /dev/
 curl -s -X DELETE "$BASE/skills/$SK1" -H "Authorization: Bearer $ATOKEN" > /dev/null && echo "  已删除 code_style skill $SK1"
 curl -s -X DELETE "$BASE/agents/$AID2" -H "Authorization: Bearer $ATOKEN" > /dev/null && echo "  已删除中文技能 agent $AID2"
 curl -s -X DELETE "$BASE/agents/$AID" -H "Authorization: Bearer $ATOKEN" > /dev/null && echo "  已删除测试 agent $AID"
+[ -n "$HITL_AID" ] && curl -s -X DELETE "$BASE/agents/$HITL_AID" -H "Authorization: Bearer $ATOKEN" > /dev/null && echo "  已删除 HITL agent $HITL_AID"
 curl -s -X DELETE "$BASE/knowledge/documents/$DOCID" -H "Authorization: Bearer $ATOKEN" > /dev/null && echo "  已删除文档 $DOCID"
 curl -s -X DELETE "$BASE/knowledge/collections/$KBID" -H "Authorization: Bearer $ATOKEN" > /dev/null && echo "  已删除知识库 $KBID"
 curl -s -X DELETE "$BASE/mcp/servers/$MCPID" -H "Authorization: Bearer $ATOKEN" > /dev/null && echo "  已删除 MCP $MCPID"

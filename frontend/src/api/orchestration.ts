@@ -8,6 +8,7 @@ export interface SubAgentInfo {
   role_prompt: string;
   tools: string[];
   model?: string;
+  model_provider_id?: number | null;
   mode: 'inline' | 'compiled' | 'async';
   is_active: boolean;
 }
@@ -17,6 +18,7 @@ export interface CreateSubAgentData {
   role_prompt: string;
   tools?: string[];
   model?: string;
+  model_provider_id?: number | null;
   mode?: 'inline' | 'compiled' | 'async';
 }
 

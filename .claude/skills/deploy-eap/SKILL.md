@@ -60,6 +60,26 @@ SSHPASS="$SSH_PASSWORD" sshpass -e ssh -o StrictHostKeyChecking=no wangyan@192.1
 服务器实际运行 LangChain/LangGraph **1.x**（langchain-core 1.5.x）。requirements.txt 若回退到 0.3.x 约束会与 `langsmith==0.3.*` 冲突（pip ResolutionImpossible）。改动依赖版本前先在服务器 dry-run：
 `cd /home/wangyan/deploy/eap/backend && .venv/bin/pip install --dry-run -r requirements.txt`
 
+deepagents 版本约束（当前 `deepagents==0.7.11`）：硬性要求 `langsmith>=0.11.2`，`deepagents` / `langsmith` 两个 pin 必须同向升级，否则 pip 解析冲突（见 requirements.txt 内注释）。
+
+### 6. Agent 工作区与容器沙箱（deepagents 后端）
+
+- **工作区目录**：`/home/wangyan/deploy/eap/agent_workspaces`（`app/core/agent/backends/__init__.py` 的 `WORKSPACE_BASE`）。每线程独立目录 `{tenant}/{user}/{thread}` 三级隔离，随对话产生；rsync `--delete` 不受影响（该目录在 deploy 目录内但非 backend/ 子路径）。
+- **container 后端**：一次性 `python:3.12-slim` 容器沙箱（`--network none --memory 256m --cpus 1 --pids-limit 64 --cap-drop ALL`），宿主线程工作目录挂载为容器内 `/workspace`，平台记忆落 `root_dir/memory/`。超时清理用的 cidfile 写在挂载外（`root_dir.parent`），容器内不可见。
+- **镜像缺失 = fail-closed**：`build_backend("container", ...)` 构建失败抛 `BackendUnavailableError`，对话直接 error 事件（绝不回退宿主机执行）。排查：`docker images python:3.12-slim` → 缺失则 `docker pull python:3.12-slim`，然后重启 `eap-backend`。
+- **容器冒烟**：`python3 -c "print(2**10)"` 经 execute 应返回 `1024`（backend=container 的 agent 对话验证，见 `backend/scripts/verify_backends.py`）。
+
+### 7. sub_agent_definitions.model_provider_id 手工迁移（子代理独立模型）
+
+模型已含该列（`backend/app/models/sub_agent.py`，Task 4 加入），但**无 Flask-Migrate/Alembic**：已有部署的库不会自动加列，漏执行会让子代理独立模型静默不生效（代码对缺列 fail-safe：`getattr(sub, "model_provider_id", None)`）。全新部署 init_db.sql 后同样需执行（幂等）：
+
+```bash
+# 在服务器上执行（凭据不内联：DATABASE_URL 在服务器 backend/.env 中）
+ssh wangyan@192.168.1.51 'cd /home/wangyan/deploy/eap/backend && set -a && . .env && set +a && psql "$DATABASE_URL" -c "ALTER TABLE sub_agent_definitions ADD COLUMN IF NOT EXISTS model_provider_id INTEGER REFERENCES model_providers(id)"'
+```
+
+验证：`psql "$DATABASE_URL" -c '\d sub_agent_definitions'` 应含 model_provider_id 列。
+
 ## 部署 SOP（每次代码修改后必须执行）
 
 1. 代码修改完成

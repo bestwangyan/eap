@@ -1,6 +1,6 @@
 import { useRef, useEffect, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { Input, Button, Select } from 'antd';
+import { Input, Button, Select, Space } from 'antd';
 import {
   SendOutlined, StopOutlined, PlusOutlined, DeleteOutlined,
   RightOutlined, DownOutlined,
@@ -85,7 +85,7 @@ function ToolRow({ msg }: { msg: ChatMessage }) {
         <span style={{ fontWeight: 700, letterSpacing: 1 }}>TOOL</span>
         <span>▸</span>
         <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-          {msg.toolName}
+          {msg.displayName || msg.toolName}
         </span>
         {running ? (
           <span className="eap-pulse">RUNNING</span>
@@ -262,7 +262,8 @@ export default function ChatPage() {
 
   const {
     messages, currentThreadId, isStreaming, selectedModelId, selectedAgentId,
-    sendMessage, cancelStream, setThreadId, setModelId, setAgentId, fetchThreads,
+    pendingApproval,
+    sendMessage, resumeChat, cancelStream, setThreadId, setModelId, setAgentId, fetchThreads,
     loadThreadHistory, clearThread,
   } = useChatStore();
 
@@ -397,6 +398,31 @@ export default function ChatPage() {
         flexShrink: 0, background: T.paper, borderTop: `1px solid ${T.line}`,
         padding: '12px 0 10px', position: 'relative', zIndex: 2,
       }}>
+        {pendingApproval && (
+          <div style={{
+            border: `1px solid ${T.amberBd}`, background: T.amberBg,
+            borderRadius: 10, padding: '10px 14px', marginBottom: 10,
+            fontFamily: T.mono, fontSize: 12,
+          }}>
+            <div style={{ fontWeight: 700, marginBottom: 4, color: T.amberTxt }}>
+              ⏸ 待人工审批 · {pendingApproval.toolName}
+            </div>
+            <div style={{
+              color: T.ink2, marginBottom: 8, whiteSpace: 'pre-wrap',
+              maxHeight: 120, overflowY: 'auto',
+            }}>
+              {pendingApproval.args}
+            </div>
+            <Space>
+              <Button size="small" type="primary" onClick={() => resumeChat(pendingApproval.approvalId, 'approve')}>
+                批准执行
+              </Button>
+              <Button size="small" danger onClick={() => resumeChat(pendingApproval.approvalId, 'reject')}>
+                拒绝
+              </Button>
+            </Space>
+          </div>
+        )}
         {isStreaming && (
           <div style={{
             fontFamily: T.mono, fontSize: 11, color: T.signal,

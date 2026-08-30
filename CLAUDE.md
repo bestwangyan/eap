@@ -63,7 +63,11 @@ The frontend React app uses `<BrowserRouter basename="/eap">` and Vite `base: '/
 
 **Multi-tenancy**: DB queries always filtered by `tenant_id` from `g` object. LangGraph thread IDs are `{tenant_slug}:{user_id}:{uuid}`.
 
-**Agent**: `app/core/agent/orchestrator.py` — builds LangGraph StateGraph with tools, streams via `stream_mode="updates"` for complete tool call args. Model selection is dynamic: user picks from `model_providers` table, orchestrator resolves API key at runtime.
+**Agent**: `app/core/agent/deep_agent_factory.py` — 基于 deepagents 的编排核心：
+create_deep_agent 组装（skills 渐进披露 / subagents / memory / backend 沙箱），
+后端双实现（FilesystemBackend local / DockerBackend container），
+HITL 通过 interrupt_on + ApprovalRequest 审批流转。模型选择动态解析
+（聊天页 > 智能体绑定 > 租户默认），图按指纹缓存。
 
 **Seed Data**: On first startup, `_init_db()` auto-creates default tenant, admin/viewer users, preset roles/permissions, and seeds `ModelProvider.seed_defaults()` from env vars.
 
