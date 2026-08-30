@@ -10,7 +10,9 @@ grep/glob/delete 均以 python3 脚本经 execute() 在容器内执行（本镜�
 python3），并返回协议规定的结构化结果（LsResult/ReadResult/...）。本类
 只需实现四个原语：execute / upload_files / download_files / id。
 """
+import re
 import subprocess
+import uuid
 from pathlib import Path
 
 from deepagents.backends.protocol import (
@@ -92,8 +94,14 @@ class DockerBackend(BaseSandbox):
             msg = f"timeout must be positive, got {effective_timeout}"
             raise ValueError(msg)
 
+        # 每次执行用唯一 cidfile 记录容器 ID（root_dir 内点文件，容器内 ls 不可见），
+        # 超时挂起时凭它精确 `docker rm -f` 强杀容器 —— --rm 只在容器进程自行
+        # 退出后清理，挂起命令（如 `sleep infinity`，LLM 提示注入可构造）否则
+        # 会永久泄漏容器（每个 256m）。
+        cidfile = self.root_dir / f".eap-cid-{uuid.uuid4().hex}"
         cmd = [
             "docker", "run", "--rm",
+            "--cidfile", str(cidfile),
             "--network", "none",
             "--memory", "256m", "--cpus", "1", "--pids-limit", "64",
             "-v", f"{self.root_dir}:{WORKSPACE_MOUNT}",
@@ -108,6 +116,7 @@ class DockerBackend(BaseSandbox):
                 timeout=effective_timeout,
             )
         except subprocess.TimeoutExpired:
+            self._rm_stuck_container(cidfile)
             if timeout is not None:
                 msg = f"Error: Command timed out after {effective_timeout} seconds (custom timeout). The command may be stuck or require more time."
             else:
@@ -119,6 +128,8 @@ class DockerBackend(BaseSandbox):
                 exit_code=1,
                 truncated=False,
             )
+        finally:
+            cidfile.unlink(missing_ok=True)
 
         out_parts = []
         if r.stdout:
@@ -130,6 +141,29 @@ class DockerBackend(BaseSandbox):
         if r.returncode != 0:
             output = f"{output.rstrip()}\n\nExit code: {r.returncode}"
         return ExecuteResponse(output=output, exit_code=r.returncode, truncated=False)
+
+    def _rm_stuck_container(self, cidfile: Path) -> None:
+        """超时兜底：`docker rm -f` 强杀仍挂起的容器，防止资源泄漏。
+
+        仅按 cidfile 内容精确删除本命令对应的容器：容器 ID 必须是 docker
+        写入的完整 64 位 hex ID（不信任任何 shell 拼接）；root_dir 会挂载进
+        容器，cidfile 理论上可能被容器内命令篡改，故内容不合规时拒绝删除
+        （fail-closed，绝不误删其他容器）。删除失败时静默放弃 —— 主路径
+        已返回超时错误，后续 --rm 语义不受影响。
+        """
+        try:
+            cid = cidfile.read_text().strip()
+        except OSError:
+            return
+        if not re.fullmatch(r"[0-9a-f]{64}", cid):
+            return
+        try:
+            subprocess.run(
+                ["docker", "rm", "-f", cid],
+                capture_output=True, text=True, timeout=30,
+            )
+        except Exception:  # noqa: BLE001
+            return
 
     def upload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
         """写入宿主 root_dir（经挂载进入容器 /workspace 视角）。
