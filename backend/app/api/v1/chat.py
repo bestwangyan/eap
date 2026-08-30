@@ -43,38 +43,49 @@ def _gen_title(message: str, max_len: int = 30) -> str:
 def chat_stream():
     """流式对话接口 (SSE) - 支持 agent 和模型选择"""
     data = request.get_json()
-    if not data or "message" not in data:
+    if not data or ("message" not in data and not data.get("resume")):
         return Response(
             f"data: {json.dumps({'type': 'error', 'message': 'message is required'})}\n\n",
             mimetype="text/event-stream",
         ), 422
 
-    user_message = data["message"]
+    user_message = data.get("message", "")
+    resume = bool(data.get("resume"))
     thread_id = data.get("thread_id")
     model_provider_id = data.get("model_provider_id")
     agent_id = data.get("agent_id")
     is_new = not thread_id
 
+    # HITL 恢复必须指定线程（恢复值来自该线程已决议的审批）
+    if resume and not thread_id:
+        return Response(
+            f"data: {json.dumps({'type': 'error', 'message': 'resume 需要 thread_id'}, ensure_ascii=False)}\n\n",
+            mimetype="text/event-stream",
+        ), 422
+
     # ===== 安全围栏：输入检查（必须在任何持久化之前执行）=====
     # 拦截（危险内容）→ 直接返回 error 事件，原始内容不落库、不创建线程
     # 脱敏（PII）→ 用脱敏后的文本走后续全部流程（标题/落库/LLM）
+    # resume 请求 message 为空（HITL 恢复，内容来自审批决定）——只跳过
+    # 检查逻辑，_guardrail 仍需实例化（generate() 的输出检查复用）
     try:
         from app.core.guardrails.chain import GuardrailChain
         _guardrail = GuardrailChain()
-        _g_input = _guardrail.check_input(user_message)
-        if not _g_input.passed:
-            logger.warning(f"Guardrail blocked input (user {g.user_id}): {_g_input.reason[:200]}")
-            AuditLog.log(
-                tenant_slug=g.tenant_slug, user_id=int(g.user_id),
-                action="guardrail:block_input", resource="chat",
-                detail={"reason": _g_input.reason[:200]}, status="blocked",
-            )
-            return Response(
-                f"data: {json.dumps({'type': 'error', 'message': f'[安全围栏] {_g_input.reason}'}, ensure_ascii=False)}\n\n",
-                mimetype="text/event-stream",
-            ), 200
-        if _g_input.modified_text and _g_input.modified_text != user_message:
-            user_message = _g_input.modified_text
+        if user_message and not resume:
+            _g_input = _guardrail.check_input(user_message)
+            if not _g_input.passed:
+                logger.warning(f"Guardrail blocked input (user {g.user_id}): {_g_input.reason[:200]}")
+                AuditLog.log(
+                    tenant_slug=g.tenant_slug, user_id=int(g.user_id),
+                    action="guardrail:block_input", resource="chat",
+                    detail={"reason": _g_input.reason[:200]}, status="blocked",
+                )
+                return Response(
+                    f"data: {json.dumps({'type': 'error', 'message': f'[安全围栏] {_g_input.reason}'}, ensure_ascii=False)}\n\n",
+                    mimetype="text/event-stream",
+                ), 200
+            if _g_input.modified_text and _g_input.modified_text != user_message:
+                user_message = _g_input.modified_text
     except Exception as e:
         # 围栏自身异常时 fail-open，不阻塞对话（可用性优先）
         logger.warning(f"Guardrail input check failed (fail-open): {e}")
@@ -87,7 +98,7 @@ def chat_stream():
     tenant_id = g.tenant_id
     full_thread_id = f"{tenant_slug}:{user_id}:{thread_id}"
 
-    # 新建线程时创建 DB 记录
+    # 新建线程时创建 DB 记录（resume 模式已有线程，不新建）
     if is_new:
         title = _gen_title(user_message)
         t = ChatThread(
@@ -98,8 +109,9 @@ def chat_stream():
         db.session.add(t)
         db.session.commit()
 
-    # 持久化用户消息
-    _save_message(tenant_id, thread_id, int(user_id), "user", user_message)
+    # 持久化用户消息（resume 模式 message 为空，不落库）
+    if user_message and not resume:
+        _save_message(tenant_id, thread_id, int(user_id), "user", user_message)
 
     def generate():
         # 第一条事件：回传 thread_id，让前端知道后端生成的 UUID
@@ -114,6 +126,7 @@ def chat_stream():
                 user_id=user_id, tenant_id=tenant_id,
                 model_provider_id=model_provider_id,
                 agent_id=agent_id,
+                resume=resume,
             ):
                 # 收集 AI 回复 token 和用量信息
                 line = sse_event.strip()
@@ -166,11 +179,12 @@ def chat_stream():
             except Exception:
                 pass
 
-        # 更新消息计数
+        # 更新消息计数（按实际落库条数计：resume 不落用户消息，AI 回复可能为空）
         try:
             t = ChatThread.query.filter_by(thread_id=thread_id).first()
             if t:
-                t.message_count = (t.message_count or 0) + 2
+                delta = int(bool(user_message) and not resume) + int(bool(ai_content))
+                t.message_count = (t.message_count or 0) + delta
                 db.session.commit()
         except Exception:
             pass

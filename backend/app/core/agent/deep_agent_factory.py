@@ -46,12 +46,11 @@ TOOL_DISPLAY_NAMES = {
     "task": "子代理调度",
 }
 
-# permission_mode → interrupt_on（HITL，Task 5 激活）
+# permission_mode → interrupt_on（HITL）
+# HITL 工具集：文件写入/编辑 + 代码执行（读取类工具不打断）
 HITL_TOOLS = ["write_file", "edit_file", "execute"]
-# Task 3 保持关闭：interrupt_on 一旦启用，execute/write/edit 会在没有
-# resume 通道（HITL API 未实现）的情况下永久挂起，破坏生产代码执行。
-# Task 5 实现 HITL API 后置为 True。
-INTERRUPT_ENABLED = False
+# Task 3 保持关闭（无 resume 通道会永久挂起）；Task 5 实现 HITL API 后启用
+INTERRUPT_ENABLED = True
 
 # 记忆文件在沙箱内的统一路径：经后端映射为
 #   local     → {thread_workspace}/memory/AGENTS.md
@@ -121,11 +120,16 @@ class DeepAgentFactory:
             tool_names = set(agent.tools_config or [])
             execute_enabled = "code_execution" in tool_names
             backend_mode = (agent.backend or "local")
-            interrupt_on = (
-                HITL_TOOLS
-                if INTERRUPT_ENABLED and (agent.permission_mode or "default") == "default"
-                else []
-            )
+            # interrupt_on 必须是 dict {tool: True}（deepagents 0.7.11 的
+            # _merge_fs_interrupt_on 对 user_interrupt_on 执行 dict.update，
+            # 传 list 会 TypeError；True = 该工具全部决策允许
+            # [approve/edit/reject/respond]）。
+            # permission_mode == "default" → HITL 全开；
+            # acceptEdits/dontAsk（自行确认/不询问）→ 全部放行（None）
+            if INTERRUPT_ENABLED and (agent.permission_mode or "default") == "default":
+                interrupt_on = {t: True for t in HITL_TOOLS}
+            else:
+                interrupt_on = None
 
             # prompt 模式 skill → deepagents skills 目录（渐进披露）
             # 最佳努力：宿主绝对路径在沙箱内不存在时跳过并告警，不影响对话

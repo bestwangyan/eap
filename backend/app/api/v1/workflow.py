@@ -57,7 +57,7 @@ def edit_and_approve(approval_id):
         return jsonify({"error": "Not found"}), 404
     data = request.get_json() or {}
     a.status = "approved"
-    a.decision = "edit"
+    a.decision = "approve"  # 编辑内容在 edited_args；decision=approve 供 orchestrator 构建 edit 恢复值
     a.edited_args = data.get("edited_args", {})
     a.resolved_by = int(g.user_id)
     db.session.commit()

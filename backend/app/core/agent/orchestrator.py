@@ -53,6 +53,9 @@ from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_anthropic import ChatAnthropic
 from langchain_openai import ChatOpenAI
 
+from app.extensions import db
+from app.models.approval import ApprovalRequest
+
 from app.core.agent.deep_agent_factory import TOOL_DISPLAY_NAMES
 from app.core.agent.tools import DEFAULT_TOOLS
 from app.core.agent.prompts.system import DEFAULT_SYSTEM_PROMPT
@@ -565,15 +568,21 @@ class AgentOrchestrator:
         tenant_id: str,
         model_provider_id: int | None = None,
         agent_id: int | None = None,
+        resume: bool = False,
     ):
         """
         流式对话主入口 —— 接收用户消息，逐条产出 SSE 事件。
+
+        resume=True 时进入 HITL 恢复分支：不注入新消息，从该 thread 最近
+        已决议（approved/rejected）的审批记录构建 Command(resume=...)，
+        以恢复值重启 graph.stream 继续执行被中断的工具调用。
 
         SSE 事件类型：
           thread_id:  后端生成的对话 UUID（新对话时作为第一条事件发送）
           token:      LLM 输出的文本片段（逐 token 流式推送）
           tool_start: 工具调用开始（含完整调用参数）
           tool_end:   工具调用完成（含执行结果）
+          interrupt:  工具调用触发 HITL 审批（含 approval_id/tool_name/args）
           done:       本轮对话结束（含 token 用量统计）
           error:      异常中断（含错误信息）
 
@@ -584,18 +593,19 @@ class AgentOrchestrator:
           4. 创建 Trace 回调（记录 LLM/Tool 事件到 trace_events 表）
           5. 构建系统提示词（Agent + Skill）
           6. 向 LangGraph 发送 [SystemMessage, HumanMessage]
-          7. 迭代 graph.stream() 的节点更新，逐个格式化 SSE 事件
-          8. 收集 token 用量，在 done 事件中返回
+             （resume 分支改发 Command(resume=...)，不注入新消息）
+          7. 迭代 graph.stream() 的节点更新，逐个格式化 SSE 事件（共用
+             映射循环 _emit_stream：正常流与 resume 流同一路径）
+          8. 流结束后检测 HITL 中断（graph.get_state().interrupts）：
+             中断 → 建 ApprovalRequest 落库 + 发射 interrupt 事件，不发 done
+             无中断 → 收集 token 用量，在 done 事件中返回
 
-        为什么用 stream_mode="updates" 而不是 "messages"？
-          "messages" 模式输出的是 LLM 流式 token chunk，
-          当 LLM 生成 tool_call 时，单个 chunk 中 tool_call 的 args 可能不完整。
-          "updates" 模式等每个节点执行完毕后输出完整状态，
-          此时 tool_call 的 name + args 都是完整的，前端可以准确展示。
-
-        为什么是同步生成器而不是 async？
-          LangGraph 的 stream() 是同步迭代器。
-          Flask 使用 gevent worker 时，同步代码天然支持 SSE 流式响应。
+        HITL 恢复值协议（实测 deepagents 0.7.11 / langchain human_in_the_loop）：
+          resume = {"decisions": [ {"type": "approve"}
+                                    | {"type": "reject"}
+                                    | {"type": "edit",
+                                       "edited_action": {"name", "args"}} ]}
+        decisions 必须与中断批次的 action_requests 一一对应（同序）。
         """
 
         # ------------------------------------------------------------------
@@ -691,169 +701,92 @@ class AgentOrchestrator:
 
         # 清理上轮不完整的 tool_calls（子Agent 超时导致请求中断，
         # checkpointer 只保存了 AIMessage(tool_calls) 而没有 ToolMessage）
-        _cleanup_stale_checkpoint(self._checkpointer, thread_id)
+        # 注意：resume 请求不能清理 —— 中断态的 checkpoint 正是恢复所需的
+        # 状态（AIMessage(tool_calls) 无 ToolMessage 是 HITL 中断的常态）
+        if not resume:
+            _cleanup_stale_checkpoint(self._checkpointer, thread_id)
 
         # ------------------------------------------------------------------
         # 安全围栏：输入防御纵深
         # chat.py 已做首道拦截（持久化前），这里兜底其他直接调用本方法的路径
         # 拦截 → error 事件并终止；脱敏 → 用脱敏文本继续
         # 围栏自身异常 → fail-open（可用性优先）
+        # resume 请求 message 为空，不做输入围栏（恢复值来自审批决定）
         # ------------------------------------------------------------------
-        try:
-            from app.core.guardrails.chain import GuardrailChain
-            _g = GuardrailChain().check_input(user_message)
-            if not _g.passed:
-                logger.warning(f"Guardrail blocked input in orchestrator: {_g.reason[:200]}")
-                yield f"data: {json.dumps({'type': 'error', 'message': f'[安全围栏] {_g.reason}'}, ensure_ascii=False)}\n\n"
-                return
-            if _g.modified_text and _g.modified_text != user_message:
-                user_message = _g.modified_text
-        except Exception as e:
-            logger.warning(f"Guardrail check failed in orchestrator (fail-open): {e}")
+        if not resume:
+            try:
+                from app.core.guardrails.chain import GuardrailChain
+                _g = GuardrailChain().check_input(user_message)
+                if not _g.passed:
+                    logger.warning(f"Guardrail blocked input in orchestrator: {_g.reason[:200]}")
+                    yield f"data: {json.dumps({'type': 'error', 'message': f'[安全围栏] {_g.reason}'}, ensure_ascii=False)}\n\n"
+                    return
+                if _g.modified_text and _g.modified_text != user_message:
+                    user_message = _g.modified_text
+            except Exception as e:
+                logger.warning(f"Guardrail check failed in orchestrator (fail-open): {e}")
 
         try:
-            last_usage = None  # 收集最后一次 LLM 调用的 token 用量信息
-            # task 工具 → 子代理名映射（tool_call_id → subagent_type）：
-            # tool_start 以子代理名发射，tool_end 必须同名（前端按精确名
-            # 匹配成对 tool_start/tool_end，deepagents 的 task ToolMessage
-            # 其 name 为 "task"）
-            task_calls: dict[str, str] = {}
-
             # ------------------------------------------------------------------
-            # Step 5: 构建系统提示词
-            # 包含全局规则 + Agent 自定义指令 + Skill 行为规则
+            # Step 5: 构建系统提示词（全局规则 + Agent 自定义指令 + Skill 规则）
             # ------------------------------------------------------------------
             system_prompt = self._build_system_prompt(agent_id, tenant_id, user_id=user_id)
 
-            # ------------------------------------------------------------------
-            # Step 6-7: 执行 LangGraph，双流迭代
-            #
-            # stream_mode=["messages", "updates"] 同时产出两个流：
-            #   ("messages", (AIMessageChunk, metadata))
-            #       LLM 逐 token 的文本增量 → 前端打字机式渲染
-            #   ("updates", {node_name: {messages: [...]}})
-            #       节点完成后完整状态 → 工具调用完整参数 + 用量元数据
-            #
-            # 示例迭代序列（一次带工具调用的对话）：
-            #   messages: token, token, ... （第一轮 LLM 文本，通常为空）
-            #   updates:  {"agent": AIMessage(tool_calls=[...])}  → tool_start
-            #   updates:  {"tools": ToolMessage(...)}             → tool_end
-            #   messages: token, token, ... （最终回复逐 token）
-            #   updates:  {"agent": AIMessage(content=完整回复)}  → 收集用量
-            #
-            # 文本只从 messages 流发射（updates 里的完整回复不再重复发射），
-            # 工具事件只从 updates 流发射（messages 流中的 tool_call_chunks 忽略）。
-            # ------------------------------------------------------------------
-            for stream_item in graph.stream(
-                {"messages": [
-                    SystemMessage(content=system_prompt),   # 含 Agent + Skill 规则
-                    HumanMessage(content=user_message),     # 用户输入
-                ]},
-                config,
-                stream_mode=["messages", "updates"],
-            ):
-                mode, payload = stream_item
-
-                # ----------------------------------------------------------
-                # messages 流：LLM 文本增量 → 逐 token 发射
-                # ----------------------------------------------------------
-                if mode == "messages":
-                    chunk, _chunk_meta = payload
-                    if hasattr(chunk, "content") and chunk.content:
-                        content = chunk.content
-                        if isinstance(content, list):
-                            text = "".join(
-                                c.get("text", "") if isinstance(c, dict) else str(c)
-                                for c in content
-                            )
-                        elif isinstance(content, str):
-                            text = content
-                        else:
-                            text = str(content)
-                        if text:
-                            yield f"data: {json.dumps({'type': 'token', 'content': text}, ensure_ascii=False)}\n\n"
-                    continue
-
-                # ----------------------------------------------------------
-                # updates 流：节点完整输出
-                # 只处理 ToolMessage（tool_end）、tool_calls（tool_start）
-                # 和 usage_metadata（用量），文本不再从这里发射
-                # ----------------------------------------------------------
-                for _node_name, node_output in payload.items():
-                    # 中间件钩子节点（如 patch_tool_calls.before_agent、
-                    # 子代理 task 的中间件）输出可能为 None，需跳过
-                    messages = (node_output or {}).get("messages", [])
-                    for msg in messages:
-                        # --------------------------------------------------
-                        # ToolMessage → 只发 tool_end，不发 token 事件
-                        # --------------------------------------------------
-                        if hasattr(msg, "type") and msg.type == "tool":
-                            # task 工具的 ToolMessage：其 name 恒为 "task"，
-                            # 须映射回 tool_start 已发射的子代理名
-                            tool_name = task_calls.get(
-                                getattr(msg, "tool_call_id", None),
-                                getattr(msg, "name", "unknown"),
-                            )
-                            tool_output = str(msg.content) if hasattr(msg, "content") else ""
-                            yield f"data: {json.dumps({'type': 'tool_end', 'tool': tool_name, 'output': tool_output[:500]}, ensure_ascii=False)}\n\n"
-                            continue
-
-                        # --------------------------------------------------
-                        # LLM 请求调用工具 → tool_start 事件
-                        # tool_calls 可能是 dict (LangChain 新版本) 或对象 (旧版本)
-                        # 每个 tool_call 包含 name（工具名）和 args（参数）
-                        # --------------------------------------------------
-                        if hasattr(msg, "tool_calls") and msg.tool_calls:
-                            for tc in msg.tool_calls:
-                                if isinstance(tc, dict):
-                                    tool_name = tc.get("name", "")
-                                    tool_args = tc.get("args", {})
-                                    tc_id = tc.get("id", "")
-                                else:
-                                    tool_name = getattr(tc, "name", "unknown")
-                                    tool_args = getattr(tc, "args", {})
-                                    tc_id = getattr(tc, "id", "")
-                                if not tool_name:
-                                    continue
-                                # deepagents 默认工具中文别名（前端展示用）
-                                display_name = TOOL_DISPLAY_NAMES.get(tool_name)
-                                # task 工具 → 以子代理类型名发射
-                                # （与旧协议 sub_agent_*/skill_* 工具名一致，
-                                # 前端/回归测试按此名匹配；task 本体工具名
-                                # 是 "task"，调用参数 subagent_type 才是身份）
-                                if tool_name == "task":
-                                    sub_type = (
-                                        tool_args.get("subagent_type")
-                                        if isinstance(tool_args, dict) else None
-                                    ) or tool_name
-                                    task_calls[tc_id] = sub_type
-                                    tool_name = sub_type
-                                event = {"type": "tool_start", "tool": tool_name,
-                                         "input": json.dumps(tool_args, ensure_ascii=False)}
-                                if display_name:
-                                    event["display_name"] = display_name
-                                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-
-                        # (tool_end 事件已在 ToolMessage 入口统一处理)
-
-                        # --------------------------------------------------
-                        # 收集 token 用量（来自 LLM 响应的 usage_metadata）
-                        # DeepSeek/OpenAI 的 AIMessage 自动携带 usage_metadata:
-                        #   {"input_tokens": 523, "output_tokens": 555, "total_tokens": 1078}
-                        # 用最后一次的用量覆盖（多轮 LLM 调用时累积的是全部的）
-                        # 注意：这里取最后一次，因为每轮 graph 迭代可能有多轮 LLM 调用
-                        # --------------------------------------------------
-                        if hasattr(msg, "usage_metadata") and msg.usage_metadata:
-                            input_tokens = msg.usage_metadata.get("input_tokens", 0)
-                            output_tokens = msg.usage_metadata.get("output_tokens", 0)
-                            if input_tokens or output_tokens:
-                                last_usage = {"input_tokens": input_tokens, "output_tokens": output_tokens}
+            if resume:
+                # ------------------------------------------------------------
+                # Step 6R: HITL 恢复分支
+                # 读取该 thread 已决议（approved/rejected）且未消费的审批，
+                # 构建 Command(resume={"decisions": [...]}) 重启被中断的
+                # 工具调用。审批记录由 workflow API 写入 status/decision/
+                # edited_args；此处只消费、不决议。
+                # 消费标记（status → resumed）防重复恢复；流异常时回滚
+                # 以保留重试机会。
+                # ------------------------------------------------------------
+                resume_cmd, approvals, rerr = self._build_resume_command(
+                    tenant_id, thread_id)
+                if resume_cmd is None:
+                    yield f"data: {json.dumps({'type': 'error', 'message': rerr or '没有待恢复的审批'}, ensure_ascii=False)}\n\n"
+                    return
+                for _a in approvals:
+                    _a.status = "resumed"
+                db.session.commit()
+                try:
+                    last_usage, interrupted = yield from self._emit_stream(
+                        graph.stream(resume_cmd, config,
+                                     stream_mode=["messages", "updates"]),
+                        graph, config, tenant_id, thread_id, user_id)
+                except Exception:
+                    for _a in approvals:
+                        _a.status = (
+                            "approved" if _a.decision != "reject" else "rejected"
+                        )
+                    db.session.commit()
+                    raise
+            else:
+                # ------------------------------------------------------------
+                # Step 6-7: 正常路径 —— 执行 LangGraph，双流迭代
+                # 映射逻辑与 resume 流共用 _emit_stream
+                # ------------------------------------------------------------
+                last_usage, interrupted = yield from self._emit_stream(
+                    graph.stream(
+                        {"messages": [
+                            SystemMessage(content=system_prompt),
+                            HumanMessage(content=user_message),
+                        ]},
+                        config,
+                        stream_mode=["messages", "updates"],
+                    ),
+                    graph, config, tenant_id, thread_id, user_id)
 
             # ------------------------------------------------------------------
             # Step 8: 发送 done 事件，附带 token 用量 + trace_id
             # chat.py 的 generate() 会解析 usage 并调用 CostTracker.record()
             # trace_id 供前端展示本次对话的遥测标识（可跳转监控页溯源）
+            # 中断路径不发射 done —— _emit_stream 已发射 interrupt 事件，
+            # 等待审批后经 resume 续流（下一轮流结束时才 done）
             # ------------------------------------------------------------------
+            if interrupted:
+                return
             done_data: dict = {"type": "done"}
             if last_usage:
                 done_data["usage"] = last_usage
@@ -869,6 +802,224 @@ class AgentOrchestrator:
         except Exception as e:
             logger.exception(f"Agent stream error for thread {thread_id}")
             yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+
+    # =========================================================================
+    # HITL 共用流映射 + 恢复值构建
+    # =========================================================================
+
+    def _emit_stream(self, stream_iter, graph, config,
+                     tenant_id: str, thread_id: str, user_id: str):
+        """共用双流映射循环（正常流与 resume 流同一路径）。
+
+        逐条将 graph.stream 的 (mode, payload) 映射为 SSE 事件
+        （token / tool_start / tool_end）；流结束后检测 HITL 中断：
+          有中断 → 逐条建 ApprovalRequest 落库（status=pending）并发射
+                   interrupt 事件，返回 (last_usage, True)
+          无中断 → 返回 (last_usage, False)
+
+        文本只从 messages 流发射（updates 里的完整回复不再重复发射），
+        工具事件只从 updates 流发射（messages 流中的 tool_call_chunks 忽略）。
+        """
+        last_usage = None  # 收集最后一次 LLM 调用的 token 用量信息
+        # task 工具 → 子代理名映射（tool_call_id → subagent_type）：
+        # tool_start 以子代理名发射，tool_end 必须同名（前端按精确名
+        # 匹配成对 tool_start/tool_end，deepagents 的 task ToolMessage
+        # 其 name 为 "task"）
+        task_calls: dict[str, str] = {}
+
+        for stream_item in stream_iter:
+            mode, payload = stream_item
+
+            # ----------------------------------------------------------
+            # messages 流：LLM 文本增量 → 逐 token 发射
+            # ----------------------------------------------------------
+            if mode == "messages":
+                chunk, _chunk_meta = payload
+                if hasattr(chunk, "content") and chunk.content:
+                    content = chunk.content
+                    if isinstance(content, list):
+                        text = "".join(
+                            c.get("text", "") if isinstance(c, dict) else str(c)
+                            for c in content
+                        )
+                    elif isinstance(content, str):
+                        text = content
+                    else:
+                        text = str(content)
+                    if text:
+                        yield f"data: {json.dumps({'type': 'token', 'content': text}, ensure_ascii=False)}\n\n"
+                continue
+
+            # ----------------------------------------------------------
+            # updates 流：节点完整输出
+            # 只处理 ToolMessage（tool_end）、tool_calls（tool_start）
+            # 和 usage_metadata（用量），文本不再从这里发射
+            # ----------------------------------------------------------
+            # 中断节点（HumanInTheLoopMiddleware.after_model）的更新值是
+            # tuple(Interrupt, ...) 或 None，不是 dict —— 必须跳过
+            if not isinstance(payload, dict):
+                continue
+            for _node_name, node_output in payload.items():
+                # 中间件钩子节点（如 patch_tool_calls.before_agent、
+                # 子代理 task 的中间件）输出可能为 None，需跳过
+                if not isinstance(node_output, dict):
+                    continue
+                messages = node_output.get("messages", [])
+                for msg in messages:
+                    # --------------------------------------------------
+                    # ToolMessage → 只发 tool_end，不发 token 事件
+                    # --------------------------------------------------
+                    if hasattr(msg, "type") and msg.type == "tool":
+                        # task 工具的 ToolMessage：其 name 恒为 "task"，
+                        # 须映射回 tool_start 已发射的子代理名
+                        tool_name = task_calls.get(
+                            getattr(msg, "tool_call_id", None),
+                            getattr(msg, "name", "unknown"),
+                        )
+                        tool_output = str(msg.content) if hasattr(msg, "content") else ""
+                        yield f"data: {json.dumps({'type': 'tool_end', 'tool': tool_name, 'output': tool_output[:500]}, ensure_ascii=False)}\n\n"
+                        continue
+
+                    # --------------------------------------------------
+                    # LLM 请求调用工具 → tool_start 事件
+                    # tool_calls 可能是 dict (LangChain 新版本) 或对象 (旧版本)
+                    # 每个 tool_call 包含 name（工具名）和 args（参数）
+                    # --------------------------------------------------
+                    if hasattr(msg, "tool_calls") and msg.tool_calls:
+                        for tc in msg.tool_calls:
+                            if isinstance(tc, dict):
+                                tool_name = tc.get("name", "")
+                                tool_args = tc.get("args", {})
+                                tc_id = tc.get("id", "")
+                            else:
+                                tool_name = getattr(tc, "name", "unknown")
+                                tool_args = getattr(tc, "args", {})
+                                tc_id = getattr(tc, "id", "")
+                            if not tool_name:
+                                continue
+                            # deepagents 默认工具中文别名（前端展示用）
+                            display_name = TOOL_DISPLAY_NAMES.get(tool_name)
+                            # task 工具 → 以子代理类型名发射
+                            # （与旧协议 sub_agent_*/skill_* 工具名一致，
+                            # 前端/回归测试按此名匹配；task 本体工具名
+                            # 是 "task"，调用参数 subagent_type 才是身份）
+                            if tool_name == "task":
+                                sub_type = (
+                                    tool_args.get("subagent_type")
+                                    if isinstance(tool_args, dict) else None
+                                ) or tool_name
+                                task_calls[tc_id] = sub_type
+                                tool_name = sub_type
+                            event = {"type": "tool_start", "tool": tool_name,
+                                     "input": json.dumps(tool_args, ensure_ascii=False)}
+                            if display_name:
+                                event["display_name"] = display_name
+                            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+                    # (tool_end 事件已在 ToolMessage 入口统一处理)
+
+                    # --------------------------------------------------
+                    # 收集 token 用量（来自 LLM 响应的 usage_metadata）
+                    # DeepSeek/OpenAI 的 AIMessage 自动携带 usage_metadata:
+                    #   {"input_tokens": 523, "output_tokens": 555, "total_tokens": 1078}
+                    # 用最后一次的用量覆盖（多轮 LLM 调用时累积的是全部的）
+                    # --------------------------------------------------
+                    if hasattr(msg, "usage_metadata") and msg.usage_metadata:
+                        input_tokens = msg.usage_metadata.get("input_tokens", 0)
+                        output_tokens = msg.usage_metadata.get("output_tokens", 0)
+                        if input_tokens or output_tokens:
+                            last_usage = {"input_tokens": input_tokens, "output_tokens": output_tokens}
+
+        # ----------------------------------------------------------------
+        # 流结束后检测 HITL 中断（deepagents 中断实现：流在此处干净结束，
+        # 中断信息留在 checkpoint，get_state 可见；resume 后从中断点续跑）
+        # 实测 payload 形状（deepagents 0.7.11，task-5 spike）：
+        #   interrupts = (Interrupt,)
+        #   Interrupt.value = {
+        #       "action_requests": [{"name": str, "args": dict, "description": str}],
+        #       "review_configs": [{"action_name": str, "allowed_decisions": [...]}],
+        #   }
+        # 一个中断批次可能有多个 action_requests → 逐条建审批，
+        # resume 时 decisions 需与之一一对应（同序）
+        # ----------------------------------------------------------------
+        interrupted = False
+        created: list = []
+        try:
+            state = graph.get_state(config)
+        except Exception as e:
+            logger.warning(f"get_state after stream failed for {thread_id}: {e}")
+            state = None
+        for intr in (state.interrupts or []) if state else []:
+            value = getattr(intr, "value", None)
+            if not isinstance(value, dict):
+                continue
+            for ar in value.get("action_requests") or []:
+                if not isinstance(ar, dict):
+                    continue
+                tool_name = ar.get("name") or "unknown"
+                tool_args = ar.get("args") or {}
+                appr = ApprovalRequest(
+                    tenant_id=int(tenant_id), thread_id=thread_id,
+                    agent_name=None, tool_name=tool_name, tool_args=tool_args,
+                    status="pending", requested_by=int(user_id),
+                )
+                db.session.add(appr)
+                created.append((appr, tool_name, tool_args))
+        if created:
+            try:
+                db.session.commit()
+            except Exception:
+                db.session.rollback()
+                raise
+            interrupted = True
+            for appr, tool_name, tool_args in created:
+                logger.info(
+                    "HITL interrupt: thread=%s tool=%s approval_id=%s",
+                    thread_id, tool_name, appr.id)
+                yield f"data: {json.dumps({'type': 'interrupt', 'approval_id': appr.id, 'tool_name': tool_name, 'args': tool_args}, ensure_ascii=False)}\n\n"
+        return last_usage, interrupted
+
+    def _build_resume_command(self, tenant_id: str, thread_id: str):
+        """读取该 thread 已决议且未消费的审批，构建 HITL 恢复 Command。
+
+        未消费 = status 仍为 approved/rejected（workflow API 决议后写入；
+        本次恢复时统一置为 resumed 防重复）。同批中断的多个 action_requests
+        建了多条审批（id asc），decisions 必须与之同序一一对应 —— 若该
+        thread 仍存在 pending 审批，拒绝部分恢复（返回错误信息）。
+
+        返回 (Command | None, approvals, error_msg | None)。
+        """
+        from langgraph.types import Command
+
+        approvals = ApprovalRequest.query.filter(
+            ApprovalRequest.tenant_id == int(tenant_id),
+            ApprovalRequest.thread_id == thread_id,
+            ApprovalRequest.status.in_(("approved", "rejected")),
+        ).order_by(ApprovalRequest.id.asc()).all()
+        if not approvals:
+            return None, [], "没有待恢复的审批"
+        pending_left = ApprovalRequest.query.filter(
+            ApprovalRequest.tenant_id == int(tenant_id),
+            ApprovalRequest.thread_id == thread_id,
+            ApprovalRequest.status == "pending",
+        ).count()
+        if pending_left:
+            return None, [], "该对话仍有未处理的审批，请先完成全部审批后再恢复"
+        decisions = []
+        for a in approvals:
+            if a.decision == "reject":
+                decisions.append({"type": "reject"})
+            elif a.decision == "approve" and a.edited_args:
+                decisions.append({
+                    "type": "edit",
+                    "edited_action": {
+                        "name": a.tool_name or "unknown",
+                        "args": a.edited_args,
+                    },
+                })
+            else:
+                decisions.append({"type": "approve"})
+        return Command(resume={"decisions": decisions}), approvals, None
 
     # =========================================================================
     # 遗留方法（备用 / 向后兼容）
