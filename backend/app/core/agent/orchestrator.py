@@ -143,6 +143,41 @@ def _cleanup_stale_checkpoint(checkpointer, thread_id: str) -> None:
         logger.debug(f"Stale checkpoint check skipped: {e}")
 
 
+def _orphan_abandoned_approvals(thread_id: str) -> int:
+    """新消息路径：把该线程所有未消费的已决议审批标记为 orphaned。
+
+    场景（review Minor 5 / Important 1）：批次 1 中断 → 审批已决议
+    （approved/rejected）但用户未 resume，转而发新消息 —— 中断态
+    checkpoint 被清理，批次 1 的审批成为孤儿。若不加标记，后续批次 2
+    的 resume 查询会把这些旧决议混入 decisions，与当前批次的
+    action_requests 一一对应时错配。此处统一标记为 orphaned，
+    使旧批次不再参与未来 resume 查询（_build_resume_command 只读
+    approved/rejected；workflow API 的 pending 守卫天然兼容）。
+
+    仅标记"已决议"行（approved/rejected）：pending 行仍保留在审批
+    列表中供用户处理。幂等：仅处理未消费行，consumed(resumed) 不触碰。
+
+    返回标记行数。
+    """
+    try:
+        rows = ApprovalRequest.query.filter(
+            ApprovalRequest.thread_id == thread_id,
+            ApprovalRequest.status.in_(("approved", "rejected")),
+        ).all()
+        for r in rows:
+            r.status = "orphaned"
+        if rows:
+            db.session.commit()
+            logger.info(
+                "HITL abandon: orphaned %d resolved approval(s) for thread %s",
+                len(rows), thread_id)
+        return len(rows)
+    except Exception as e:
+        db.session.rollback()
+        logger.warning(f"Failed to orphan approvals for {thread_id}: {e}")
+        return 0
+
+
 class AgentOrchestrator:
     """
     Agent 编排器 —— 管理 LangGraph Agent 的完整生命周期。
@@ -597,7 +632,9 @@ class AgentOrchestrator:
           7. 迭代 graph.stream() 的节点更新，逐个格式化 SSE 事件（共用
              映射循环 _emit_stream：正常流与 resume 流同一路径）
           8. 流结束后检测 HITL 中断（graph.get_state().interrupts）：
-             中断 → 建 ApprovalRequest 落库 + 发射 interrupt 事件，不发 done
+             中断 → 建 ApprovalRequest 落库 + 发射 interrupt 事件，并以
+                   done(interrupted=true) 收尾（附 usage，中断轮成本入账；
+                   事件类型仍为 done，前端兼容）
              无中断 → 收集 token 用量，在 done 事件中返回
 
         HITL 恢复值协议（实测 deepagents 0.7.11 / langchain human_in_the_loop）：
@@ -726,6 +763,14 @@ class AgentOrchestrator:
             except Exception as e:
                 logger.warning(f"Guardrail check failed in orchestrator (fail-open): {e}")
 
+        # 新消息通过围栏、确认继续 → 把该线程未消费的已决议审批标记为
+        # orphaned（review Minor 5）：此前批次已审批但用户放弃 resume
+        # 转而发新消息，中断态 checkpoint 将随流继续被清理，旧决议不得
+        # 混入未来批次的 resume decisions。放在围栏之后：消息被拦截时
+        # 不清除任何审批，批次仍可正常 resume。
+        if not resume:
+            _orphan_abandoned_approvals(thread_id)
+
         try:
             # ------------------------------------------------------------------
             # Step 5: 构建系统提示词（全局规则 + Agent 自定义指令 + Skill 规则）
@@ -741,9 +786,12 @@ class AgentOrchestrator:
                 # edited_args；此处只消费、不决议。
                 # 消费标记（status → resumed）防重复恢复；流异常时回滚
                 # 以保留重试机会。
+                # 传入 graph+config：resume 前先读当前活跃中断批次的
+                # action_requests 数量，仅取该批次的决议构建 decisions，
+                # 防止被放弃的旧批次决议混入（review Important 1）。
                 # ------------------------------------------------------------
                 resume_cmd, approvals, rerr = self._build_resume_command(
-                    tenant_id, thread_id)
+                    tenant_id, thread_id, graph, config)
                 if resume_cmd is None:
                     yield f"data: {json.dumps({'type': 'error', 'message': rerr or '没有待恢复的审批'}, ensure_ascii=False)}\n\n"
                     return
@@ -782,10 +830,16 @@ class AgentOrchestrator:
             # Step 8: 发送 done 事件，附带 token 用量 + trace_id
             # chat.py 的 generate() 会解析 usage 并调用 CostTracker.record()
             # trace_id 供前端展示本次对话的遥测标识（可跳转监控页溯源）
-            # 中断路径不发射 done —— _emit_stream 已发射 interrupt 事件，
-            # 等待审批后经 resume 续流（下一轮流结束时才 done）
+            # 中断轮同样发射 done（review Important 2）：chat.py 的
+            # CostTracker 以 done 事件的 usage 为唯一入口，不发射则中断轮
+            # LLM 用量漏记成本。事件类型仍是 done（附加 interrupted 标志），
+            # Task 6 前端实现前不受影响；等待审批后经 resume 续流。
             # ------------------------------------------------------------------
             if interrupted:
+                done_data: dict = {"type": "done", "interrupted": True}
+                if last_usage:
+                    done_data["usage"] = last_usage
+                yield f"data: {json.dumps(done_data)}\n\n"
                 return
             done_data: dict = {"type": "done"}
             if last_usage:
@@ -942,13 +996,17 @@ class AgentOrchestrator:
         # 一个中断批次可能有多个 action_requests → 逐条建审批，
         # resume 时 decisions 需与之一一对应（同序）
         # ----------------------------------------------------------------
-        interrupted = False
         created: list = []
         try:
             state = graph.get_state(config)
         except Exception as e:
             logger.warning(f"get_state after stream failed for {thread_id}: {e}")
             state = None
+        # 活跃中断判定以 get_state().interrupts 为准（review Minor 4）：
+        # 即使 action_requests 为空/畸形（落库数为 0），有活跃中断就返回
+        # interrupted=True，保证绝不发"无标志 done"（中断轮 done 必带
+        # interrupted 标志，前端/成本入账可区分）
+        interrupted = bool(state.interrupts) if state else False
         for intr in (state.interrupts or []) if state else []:
             value = getattr(intr, "value", None)
             if not isinstance(value, dict):
@@ -971,25 +1029,58 @@ class AgentOrchestrator:
             except Exception:
                 db.session.rollback()
                 raise
-            interrupted = True
             for appr, tool_name, tool_args in created:
                 logger.info(
                     "HITL interrupt: thread=%s tool=%s approval_id=%s",
                     thread_id, tool_name, appr.id)
                 yield f"data: {json.dumps({'type': 'interrupt', 'approval_id': appr.id, 'tool_name': tool_name, 'args': tool_args}, ensure_ascii=False)}\n\n"
+        elif interrupted:
+            # 有活跃中断但 action_requests 为空/畸形（落库数 0）：
+            # 视为异常记录日志；done 仍带 interrupted 标志（见上）
+            logger.warning(
+                "HITL interrupt without creatable action_requests: "
+                "thread=%s (interrupts=%d)", thread_id,
+                len(state.interrupts) if state else 0)
         return last_usage, interrupted
 
-    def _build_resume_command(self, tenant_id: str, thread_id: str):
-        """读取该 thread 已决议且未消费的审批，构建 HITL 恢复 Command。
+    def _build_resume_command(self, tenant_id: str, thread_id: str,
+                              graph=None, config=None):
+        """读取该 thread 当前活跃中断批次的决议，构建 HITL 恢复 Command。
 
         未消费 = status 仍为 approved/rejected（workflow API 决议后写入；
         本次恢复时统一置为 resumed 防重复）。同批中断的多个 action_requests
-        建了多条审批（id asc），decisions 必须与之同序一一对应 —— 若该
-        thread 仍存在 pending 审批，拒绝部分恢复（返回错误信息）。
+        建了多条审批（id asc），decisions 必须与之同序一一对应。
+
+        review Important 1 修复：resume 前先经 graph.get_state(config).interrupts
+        取当前活跃批次的 action_requests 数量 N，仅取**最近 N 个**未消费的
+        已决议行（按 id asc）构建 decisions —— 被放弃的旧批次（新消息后
+        标记 orphaned，或本修复前的残留 approved/rejected 行）不会混入
+        当前批次；已决议数不足 N 时拒绝恢复（等待全部审批决议），杜绝
+        中间件按同序 zip 截断/错配决定。get_state 失败时 fail-open
+        （batch_n=None，退回旧语义：全部未消费决议）。
 
         返回 (Command | None, approvals, error_msg | None)。
         """
         from langgraph.types import Command
+
+        # 当前活跃中断批次的 action_requests 数量 N
+        batch_n: int | None = None
+        if graph is not None and config is not None:
+            try:
+                state = graph.get_state(config)
+                batch_n = 0
+                for intr in (state.interrupts or []) if state else []:
+                    value = getattr(intr, "value", None)
+                    if not isinstance(value, dict):
+                        continue
+                    batch_n += len([
+                        ar for ar in (value.get("action_requests") or [])
+                        if isinstance(ar, dict)
+                    ])
+            except Exception as e:
+                logger.warning(
+                    f"get_state before resume failed for {thread_id}: {e}")
+                batch_n = None
 
         approvals = ApprovalRequest.query.filter(
             ApprovalRequest.tenant_id == int(tenant_id),
@@ -998,6 +1089,17 @@ class AgentOrchestrator:
         ).order_by(ApprovalRequest.id.asc()).all()
         if not approvals:
             return None, [], "没有待恢复的审批"
+        if batch_n is not None and batch_n == 0:
+            # 无活跃中断批次（如线程已被新消息放弃/清理）→ 无可恢复对象
+            return None, [], "没有活跃的中断批次可恢复（该线程不存在待恢复的审批批次）"
+        if batch_n is not None and len(approvals) < batch_n:
+            # 当前批次仍有审批未决议（或决议未落库）→ 拒绝部分恢复
+            return None, [], (
+                f"当前批次共 {batch_n} 个审批待决议，已决议 {len(approvals)} 个，"
+                f"请等待全部审批决议后再恢复")
+        if batch_n is not None:
+            # 仅取最近 N 个（当前活跃批次），id asc 保持与 action_requests 同序
+            approvals = approvals[-batch_n:]
         pending_left = ApprovalRequest.query.filter(
             ApprovalRequest.tenant_id == int(tenant_id),
             ApprovalRequest.thread_id == thread_id,

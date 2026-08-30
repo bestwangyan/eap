@@ -12,7 +12,13 @@ class ApprovalRequest(BaseModel):
     agent_name = db.Column(db.String(100))
     tool_name = db.Column(db.String(100))
     tool_args = db.Column(db.JSON)
-    status = db.Column(db.String(20), default="pending")  # pending|approved|rejected|edited
+    # pending|approved|rejected|resumed|orphaned
+    #   pending   待决议（workflow API 仅允许决议 pending 行）
+    #   approved/rejected  已决议未消费（resume 候选；被放弃的批次由
+    #                      新消息路径标记为 orphaned）
+    #   resumed   已消费（resume 成功，防重复恢复）
+    #   orphaned  已放弃（批次 checkpoint 已随新消息清理，不再参与 resume）
+    status = db.Column(db.String(20), default="pending")
     requested_by = db.Column(db.Integer, db.ForeignKey("users.id"))
     resolved_by = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=True)
     decision = db.Column(db.String(20))

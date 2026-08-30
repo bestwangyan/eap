@@ -63,6 +63,14 @@ def chat_stream():
             mimetype="text/event-stream",
         ), 422
 
+    # review Minor 3: resume 请求不得携带 message —— 恢复内容来自审批
+    # 决定，携带的 message 会被静默丢弃（历史实现），直接 422 拒绝
+    if resume and user_message:
+        return Response(
+            f"data: {json.dumps({'type': 'error', 'message': 'resume 请求不能携带 message'}, ensure_ascii=False)}\n\n",
+            mimetype="text/event-stream",
+        ), 422
+
     # ===== 安全围栏：输入检查（必须在任何持久化之前执行）=====
     # 拦截（危险内容）→ 直接返回 error 事件，原始内容不落库、不创建线程
     # 脱敏（PII）→ 用脱敏后的文本走后续全部流程（标题/落库/LLM）
