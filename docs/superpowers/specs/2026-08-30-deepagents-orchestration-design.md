@@ -39,7 +39,7 @@ stream_chat（对外协议不变：SSE 事件/围栏/运行时上下文/trace �
 
 | 现有能力 | 映射到 | 说明 |
 |---|---|---|
-| 内置工具集（calculator/datetime/web_search/code_execution/knowledge_search/memory_save/memory_search/read_skill_file） | `tools` 参数 | 全部保留，按 agent 的 tools_config 过滤；与 deepagents 默认文件工具、task 并存 |
+| 内置工具集（calculator/datetime/web_search/code_execution/knowledge_search/memory_save/memory_search/read_skill_file） | `tools` 参数 | 全部保留，按 agent 的 tools_config 过滤；与 deepagents 默认工具、task 并存 |
 | 子 Agent（SubAgentDefinition） | `subagents` dict | 表加 `model_provider_id` 实现独立模型；`sub_agent_x` 工具退役，改用 deepagents 原生 `task` 工具调度 |
 | `agent` 模式 Skill | subagent | 独立上下文 + 可配工具，取代现有 `skill_xxx` LLM 包装工具 |
 | `prompt` 模式 Skill | `skills` 目录路径 | 磁盘存储结构（SKILL.md + resources）天然兼容，从全量注入升级为渐进披露 |
@@ -48,6 +48,21 @@ stream_chat（对外协议不变：SSE 事件/围栏/运行时上下文/trace �
 | `backend` 字段（local/container） | 执行后端 | local → FilesystemBackend；container → DockerBackend |
 | MCP 工具 | `tools` 参数 | 现有 MultiServerMCPClient 缓存机制不变 |
 | 图缓存 | 缓存键扩展 | `provider:model:tools:skills:subagents:backend` 指纹（含端点哈希） |
+
+### 4.1 deepagents 默认工具（本节补充，2026-08-30 决策）
+
+deepagents 默认内置 9 个工具，与自有工具统一管理：
+
+| deepagents 工具 | 用途 | 配置映射 |
+|---|---|---|
+| `write_todos` | 任务规划清单 | 资源列表新增，默认开启 |
+| `ls` / `read_file` / `write_file` / `edit_file` / `glob` / `grep` | 文件操作（经 backend） | 资源列表新增为"文件工具组"，默认开启 |
+| `execute` | shell 执行（沙箱协议：local 自动拒绝，container 容器内执行） | **接管 `code_execution` 配置名**：tools_config 勾选 code_execution = 启用 execute |
+| `task` | 子 agent 调度（替代 `sub_agent_x`） | 与 subagents 联动，默认开启 |
+
+- **现有 `code_execution` 工具退役**：宿主机 subprocess 执行与"local = 无 shell"的安全设定矛盾；其配置名保留，映射为 execute 开关。local 模式彻底无 shell，container 模式沙箱执行
+- **统一开关**：deepagents 默认工具加入 `/agents/resources` 资源列表与 Agent 表单勾选（默认全开）；`tools_config` 过滤逻辑扩展为"自有工具 ∪ deepagents 默认工具"统一过滤
+- **中文别名**：后端 tool_start 事件附加 `display_name` 字段（如 write_todos → 任务规划、read_file → 读取文件）；前端 ToolRow 优先展示 display_name，保留原名
 
 ## 5. 执行后端设计
 
@@ -77,7 +92,7 @@ stream_chat（对外协议不变：SSE 事件/围栏/运行时上下文/trace �
   → chat.py（围栏输出检查 + 落库 + 成本记录，不变）
 ```
 
-- deepagents 内置工具（write_todos/ls/read_file/write_file/edit_file/glob/grep/execute/task）的 tool_start/end 事件按原名展示，前端 ToolRow 无需改动
+- deepagents 内置工具（write_todos/ls/read_file/write_file/edit_file/glob/grep/execute/task）的 tool_start/end 事件：后端附加 `display_name` 中文别名，前端 ToolRow 优先展示别名、保留原名
 - **技术验证点（实施第一步）**：deepagents 图的 updates 流节点输出结构是否与现有 SSE 映射逻辑兼容；不兼容则在 orchestrator 事件映射层适配，不改前端
 
 ## 7. 错误处理
@@ -106,7 +121,9 @@ backend/app/core/agent/
 其余改动：
 - `app/models/sub_agent.py`：加 `model_provider_id` 列（FK → model_providers）
 - `app/api/v1/orchestration.py`：子 agent create/update 接受 model_provider_id
-- 前端 AgentManager：子 agent 表单加"模型后端"下拉（动态加载可用模型供应商）
+- `app/core/agent/tools/code_execution.py`：**退役删除**（execute 接管），`DEFAULT_TOOLS` 与 `tools_config` 中 `code_execution` 名字保留为映射开关
+- `/agents/resources` 资源列表：新增 deepagents 默认工具条目（供前端勾选）
+- 前端 AgentManager：子 agent 表单加"模型后端"下拉；工具勾选列表展示新增默认工具；ToolRow 展示 display_name
 - `backend/requirements.txt`：`deepagents==0.7.11`（解除注释并升版），连带 langchain/langchain-core/langchain-anthropic 版本约束更新
 
 ## 9. 依赖升级
@@ -132,6 +149,7 @@ backend/app/core/agent/
 **新增测试用例**：
 - 文件工具闭环：一轮对话内 write_file → read_file 验证内容
 - 容器后端：container 模式下 execute 执行 `print(2**10)` 返回 1024
+- local 模式安全：execute 在 local 模式下被拒绝（无宿主机 shell）
 - 子 agent 独立模型：绑定 LM Studio 的子 agent 被 task 调度
 - prompt skill 渐进披露：skill 目录被加载且对话可用
 
