@@ -17,6 +17,10 @@
 | 3 | 子 Agent 映射 | sub_agent 表加 `model_provider_id`（独立模型），映射为 deepagents subagents dict |
 | 4 | Skill 映射 | `agent` 模式 → subagent（语义升级）；`prompt` 模式 → deepagents skills 渐进披露 |
 | 5 | 记忆体系 | 双层：保留 DB 全局记忆（user_memory 表 + 工具 + 注入）；新增 deepagents memory 文件（每用户，随 backend 根目录持久化） |
+| 6 | 代码执行 | 退役现有 code_execution（宿主机执行），execute 接管（配置名保留为映射开关） |
+| 7 | 默认工具管控 | 统一开关：deepagents 默认工具进资源列表可勾选，tool_start 事件带中文别名 |
+| 8 | HITL 审批策略 | permission_mode 复活：default=写操作审批，acceptEdits/dontAsk=自动；审批集固定 write_file/edit_file/execute |
+| 9 | HITL 交互 | 聊天页内嵌审批卡，批准后自动 resume 继续流式输出 |
 
 ## 3. 架构总览
 
@@ -89,6 +93,7 @@ deepagents 默认内置 9 个工具，与自有工具统一管理：
     → graph.stream(input, config, stream_mode=["messages","updates"])
       messages 流 → token 事件（打字机式流式，不变）
       updates 流 → tool_start/tool_end/done + usage + trace_id（不变）
+      interrupt 时 → interrupt 事件（HITL，见 §7.1）→ 流结束
   → chat.py（围栏输出检查 + 落库 + 成本记录，不变）
 ```
 
@@ -105,7 +110,41 @@ deepagents 默认内置 9 个工具，与自有工具统一管理：
 | 围栏异常 | fail-open（现状不变） |
 | 依赖冲突（langchain-core 1.5.4 → 1.6.x） | 部署前服务器 venv dry-run + 全量回归；冲突则锁定兼容版本组合并记录 |
 
-## 8. 新文件结构
+## 7.1 人机协同（HITL）— 本节补充，2026-08-30 决策
+
+现状：`ApprovalRequest` 表与 `/workflow/approvals` API（列表/批准/拒绝/编辑后批准）是现成但**零生产者**的死代码；`permission_mode` 字段只存不用。deepagents 原生支持 `interrupt_on`（工具执行前中断图）。本节把三者接通。
+
+### 7.1.1 审批策略 — permission_mode 复活
+
+| permission_mode | 行为 | interrupt_on 映射 |
+|---|---|---|
+| `default`（默认） | 写操作类工具需人工审批 | `["write_file", "edit_file", "execute"]` |
+| `acceptEdits` | 全部自动接受 | `[]` |
+| `dontAsk` | 全部自动 + 静默执行 | `[]` |
+
+审批集合固定三件（写文件/编辑文件/shell），不做每工具独立开关（YAGNI）。
+
+### 7.1.2 中断-恢复流转
+
+```
+图执行至审批工具 → LangGraph interrupt 暂停（checkpointer 保存状态）
+  → SSE 发出 interrupt 事件 {type, approval_id, tool_name, args}
+  → 流结束，ApprovalRequest 落库（status=pending，thread_id/tool_name/tool_args）
+  → 前端聊天页内嵌"待审批卡"（参数预览 + 批准/拒绝按钮）
+  → 用户操作（复用现有 workflow API）：
+       approve          → 恢复值=批准，图继续执行工具
+       reject           → 恢复值=拒绝，工具跳过并告知模型
+       edit_and_approve → 恢复值=编辑后参数，图按新参数执行
+  → 前端自动重新请求 /chat/stream（resume 模式：同 thread_id、空消息）
+  → graph.stream(None, config) 从断点恢复，继续 SSE 流
+```
+
+- SSE 协议扩展：新增 `interrupt` 事件（前端聊天页处理，不影响既有事件）
+- `/chat/stream` 扩展：`resume=true` 模式（无新消息，仅恢复中断的 thread）
+- 审批超时策略：无定时器 —— pending 审批保留在审批列表，恢复由用户点击批准/拒绝驱动
+- 审批记录即审计：ApprovalRequest 表已有 requested_by/resolved_by/decision/edited_args 字段，天然满足审计需求
+
+
 
 ```
 backend/app/core/agent/
@@ -123,7 +162,10 @@ backend/app/core/agent/
 - `app/api/v1/orchestration.py`：子 agent create/update 接受 model_provider_id
 - `app/core/agent/tools/code_execution.py`：**退役删除**（execute 接管），`DEFAULT_TOOLS` 与 `tools_config` 中 `code_execution` 名字保留为映射开关
 - `/agents/resources` 资源列表：新增 deepagents 默认工具条目（供前端勾选）
+- `app/api/v1/chat.py`：SSE 新增 `interrupt` 事件透传；`/chat/stream` 支持 `resume=true` 恢复模式
+- `app/api/v1/workflow.py`：approve/reject/edit_and_approve 激活为恢复值写入者（配合图恢复读取）
 - 前端 AgentManager：子 agent 表单加"模型后端"下拉；工具勾选列表展示新增默认工具；ToolRow 展示 display_name
+- 前端 Chat 页：新增"待审批卡"组件（interrupt 事件渲染 + 批准/拒绝 + 自动 resume）
 - `backend/requirements.txt`：`deepagents==0.7.11`（解除注释并升版），连带 langchain/langchain-core/langchain-anthropic 版本约束更新
 
 ## 9. 依赖升级
@@ -152,6 +194,9 @@ backend/app/core/agent/
 - local 模式安全：execute 在 local 模式下被拒绝（无宿主机 shell）
 - 子 agent 独立模型：绑定 LM Studio 的子 agent 被 task 调度
 - prompt skill 渐进披露：skill 目录被加载且对话可用
+- HITL 中断：default 模式请求写文件 → interrupt 事件 + ApprovalRequest pending 落库
+- HITL 批准恢复：approve 后 resume → 工具执行且流式继续
+- HITL 拒绝：reject 后 resume → 工具跳过且模型收到拒绝说明
 
 **验收标准**：现有 66 项回归全绿 + 新增用例全绿 + 前端聊天页完整对话冒烟（含容器模式 agent）。
 
